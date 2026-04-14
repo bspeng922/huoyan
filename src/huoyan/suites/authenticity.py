@@ -21,6 +21,7 @@ CONSISTENCY_SIGNALS: dict[str, tuple[str, float]] = {
     "long_context_integrity": ("strong", 15.0),
     "stream_integrity": ("strong", 10.0),
     "error_response_leakage": ("strong", 10.0),
+    "system_prompt_injection": ("strong", 10.0),
 }
 TOTAL_SIGNAL_WEIGHT = sum(weight for _, weight in CONSISTENCY_SIGNALS.values())
 

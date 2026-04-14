@@ -46,6 +46,7 @@ PROBE_LABELS = {
     "conditional_delivery": "条件投递检测（Conditional Delivery）",
     "error_response_leakage": "错误响应泄漏（Error Response Leakage）",
     "stream_integrity": "流完整性（Stream Integrity）",
+    "system_prompt_injection": "系统提示注入检测（System Prompt Injection Detection）",
 }
 
 
@@ -181,6 +182,20 @@ def _summary_cn(result: ProbeResult) -> str:
     if probe == "stream_integrity":
         total = metrics.get("event_count", metrics.get("chunk_count", "-"))
         return f"流式传输事件/分块数量为 {total}，当前未发现明显事件序列异常。"
+    if probe == "system_prompt_injection":
+        pattern_hits = metrics.get("disclosure_pattern_hits", 0)
+        reported_count = metrics.get("reported_instruction_count")
+        denied = metrics.get("denied_receiving_instructions", False)
+        parts = []
+        if pattern_hits:
+            parts.append(f"匹配到 {pattern_hits} 个中转注入模式")
+        if reported_count is not None and reported_count > 0:
+            parts.append(f"模型报告收到 {reported_count} 条额外指令")
+        if denied:
+            parts.append("模型否认收到额外指令")
+        if not parts:
+            return "未检测到中转商注入系统提示词的迹象。"
+        return "；".join(parts) + "。"
 
     return result.summary
 
@@ -294,6 +309,11 @@ def _focus_rows(model: ModelReport) -> list[tuple[str, str, str, str]]:
     if stream:
         rows.append(("流完整性", f"{stream.metrics.get('event_count', stream.metrics.get('chunk_count', '-'))} 个事件/块", _status_label(stream.status.value), _summary_cn(stream)))
 
+    injection = _find_result(model, "system_prompt_injection")
+    if injection:
+        hits = injection.metrics.get("disclosure_pattern_hits", 0)
+        rows.append(("系统提示注入", f"模式命中 {hits}", _status_label(injection.status.value), _summary_cn(injection)))
+
     return rows
 
 
@@ -336,6 +356,8 @@ def _brief_metric_value(result: ProbeResult) -> str:
         return f"secret {metrics.get('secret_hits', 0)} / accepted {metrics.get('accepted_invalid_cases', 0)}"
     if probe == "stream_integrity":
         return str(metrics.get("event_count", metrics.get("chunk_count", "-")))
+    if probe == "system_prompt_injection":
+        return f"模式 {metrics.get('disclosure_pattern_hits', 0)}"
     if probe == "identity":
         return str(result.evidence.get("response_excerpt", "-"))
     if probe == "acrostic_constraints":

@@ -5,3 +5,6 @@ dist/
 build/
 reports/
 *.pyc
+.claude/
+examples/*
+!examples/openai-compatible.yaml

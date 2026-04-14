@@ -151,6 +151,44 @@ report:
 - `security_retry_backoff_seconds: 3.0`
   - 安全审计探针默认指数退避起始秒数
 
+## 预估消耗
+
+单模型完整测评（默认配置，全部 suite 开启）大约产生以下 API 请求：
+
+| 探针 | 请求数 | 流式 | 输入 token/次 | 输出 token/次 |
+| --- | --- | --- | --- | --- |
+| identity | 1 | 否 | ~70 | ~20 |
+| acrostic_constraints | 1 | 否 | ~80 | ~50 |
+| boundary_reasoning | 1 | 否 | ~120 | ~30 |
+| linguistic_fingerprint | 1 | 否 | ~110 | ~70 |
+| response_consistency | 3 | 否 | ~80 | ~200 |
+| ttft_tps | 5 | 是 | ~45 | ~750 |
+| concurrency | 5 | 否 | ~15 | ~5 |
+| availability | 5 | 否 | ~15 | ~5 |
+| tool_calling | 1 | 否 | ~150 | ~30 |
+| long_context_integrity | 1 | 否 | ~15000 | ~60 |
+| token_alignment | 1 | 否 | ~60 | ~5 |
+| rate_limit_transparency | 3 | 否 | ~10 | ~10 |
+| dependency_substitution | 3 | 否 | ~90 | ~30 |
+| conditional_delivery | 1+3 预热 | 否 | ~90 / ~15 | ~30 / ~5 |
+| error_response_leakage | 3 | 否（坏请求） | ~10 | ~0 |
+| stream_integrity | 1 | 是 | ~40 | ~200 |
+| system_prompt_injection | 2 | 否 | ~60 | ~80 |
+
+**默认配置下，单模型完整测评预估消耗：**
+
+- 总请求数：约 38-42 次
+- 输入 token：约 18,000-20,000（其中 long_context_integrity 占 ~15,000）
+- 输出 token：约 4,500-5,500
+- 总 token：约 23,000-25,000
+
+**调整建议：**
+
+- 如果想快速测试，可以只开 `authenticity` + `security_audit` 两个 suite，消耗约 3,000 token
+- `long_context_integrity` 单项消耗最大（~15,000 输入 token），可通过 `long_context_target_chars` 调整文档长度或关闭 `agentic` suite 来跳过
+- `performance_stream_samples` 控制流式采样次数，默认 5 次；减少到 3 次可省约 1,500 token
+- `concurrency_levels` 和 `uptime_samples` 各产生少量 token，影响不大
+
 ## 报告里的状态是什么意思
 
 Huoyan 的单项状态有 5 种：
@@ -195,12 +233,13 @@ Huoyan 的单项状态有 5 种：
   - `long_context_integrity`
   - `stream_integrity`
   - `error_response_leakage`
+  - `system_prompt_injection`
 
 权重设计：
 
 - 弱信号：`identity`
 - 中信号：能力题、语言题、输出一致性、Token 对齐
-- 强信号：工具调用、长上下文、流完整性、错误边界
+- 强信号：工具调用、长上下文、流完整性、错误边界、系统提示注入
 
 值的意义：
 
@@ -566,7 +605,8 @@ Huoyan 的单项状态有 5 种：
 测试原理：
 
 - 发送固定 prompt
-- 比较 API usage 与本地 tokenizer 估算值
+- 比较 API usage 与本地 tiktoken 估算值
+- 对 OpenAI 家族使用精确 tokenizer，对其他模型使用 `cl100k_base` 近似估算
 
 值的意义：
 
@@ -577,14 +617,17 @@ Huoyan 的单项状态有 5 种：
 - `delta_tokens`
   - 二者差值
 - `ratio`
-  - 二者倍率
+  - API 计数与本地估算的比值（不是计费倍率）
 - `approximate`
   - 当前估算是否只是近似
 
 解读建议：
 
-- OpenAI 家族更可信
-- GLM / Kimi / Qwen 等很多时候只能近似估算
+- 这里的 ratio 是 **token 计数比值**，不是 **计费倍率**。中转站的"X 折"是价格折扣，和 token 计数无关
+- OpenAI 家族：使用精确 tokenizer（如 `o200k_base`），ratio 在 0.9-1.1 为 PASS
+- GLM / Kimi / Qwen / DeepSeek：使用 `cl100k_base` 近似估算，ratio 在 0.5-1.5 范围内标记为 SKIP（不做判定），超出则 WARN
+- 当 `approximate: true` 且状态为 SKIP 时，说明本地估算不可靠，ratio 仅供参考
+- 要验证中转站计费是否合理，需要将中转站报告的 token 单价与官方 API 对比
 
 #### TLS 加密基线（TLS Baseline）
 
@@ -709,6 +752,30 @@ Huoyan 的单项状态有 5 种：
 - 这是强信号
 - 对 `responses` 和 `anthropic-messages` 风格中转尤其有价值
 
+#### 系统提示注入检测（System Prompt Injection Detection）
+
+测试原理：
+
+- 发送不包含 system 消息的请求，让模型披露它在用户消息之前收到的所有系统级指令
+- 同时询问模型在用户消息之前收到了几条非用户指令
+- 将披露内容与已知的中转商注入模式（如"You are a helpful assistant"、"你是一个有用的助手"等）进行匹配
+
+值的意义：
+
+- `disclosure_pattern_hits`
+  - 匹配到的中转注入模式数量
+- `reported_instruction_count`
+  - 模型自报在用户消息前收到的指令条数
+- `denied_receiving_instructions`
+  - 模型是否否认收到了额外指令
+
+解读建议：
+
+- 这是强信号
+- 中转商注入系统提示词会直接影响模型行为，可能导致 identity 探针等结果失真
+- WARN 不一定意味着恶意——很多中转商只是添加默认人设，但用户有权知道
+- 如果 disclosure_pattern_hits 较高且模型承认收到了额外指令，建议结合 identity 探针综合判断
+
 #### 透明日志（Transparency Log）
 
 测试原理：
@@ -727,10 +794,11 @@ Huoyan 的单项状态有 5 种：
   - OpenAI 兼容 `chat/completions`
   - OpenAI 兼容 `responses`
   - Anthropic 兼容 `messages`
-- `Token 对齐` 对 OpenAI 家族最可信
+- `Token 对齐` 对 OpenAI 家族最可信，非 OpenAI 模型因 tokenizer 不匹配会标记为 SKIP
 - `identity` 只是弱信号，不能单独证明后端掉包
+- 中转站仪表盘上会显示大量非流式请求，这是正常的——只有 `ttft_tps` 和 `stream_integrity` 两个探针使用流式输出，其余均为非流式
 - 某些中转会返回 HTTP `200` 但 body 里嵌上游错误，Huoyan 会尽量识别，但不同中转实现差异仍然很大
-- “真实后端路由”“是否留存日志”“是否有 DDoS 防护”无法仅靠自动化探针绝对证明
+- “真实后端路由””是否留存日志””是否有 DDoS 防护”无法仅靠自动化探针绝对证明
 
 ## 建议的阅读顺序
 
@@ -739,7 +807,7 @@ Huoyan 的单项状态有 5 种：
 1. `综合保真度评分`
 2. `TTFT / 首正文延迟 / 并发 / 可用性`
 3. `tool_calling / long_context_integrity / stream_integrity`
-4. `token_alignment / error_response_leakage / TLS`
+4. `token_alignment / error_response_leakage / system_prompt_injection / TLS`
 5. 最后再看单个原始明细
 
 ## 参考配置
