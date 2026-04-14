@@ -1,0 +1,33 @@
+providers:
+  - name: relay-demo
+    base_url: https://your-relay.example.com/v1
+    api_key: sk-your-key
+    privacy_policy_url: https://your-relay.example.com/privacy
+    defaults:
+      enabled_suites:
+        - authenticity
+        - performance
+        - agentic
+        - cost_security
+        - security_audit
+      request_timeout_seconds: 60
+      completion_max_tokens: 256
+      stream_max_tokens: 512
+      concurrency_levels: [10, 30]
+      uptime_samples: 3
+      uptime_interval_seconds: 1
+      long_context_target_chars: 30000
+      security_warmup_requests: 3
+      multimodal_image_url: null
+      multimodal_expected_answer: null
+    models:
+      - model: gpt-4o
+        claimed_family: openai
+        supports_stream: true
+        supports_tools: true
+        supports_vision: true
+      - model: claude-3-7-sonnet
+        claimed_family: claude
+        supports_stream: true
+        supports_tools: true
+        supports_vision: true

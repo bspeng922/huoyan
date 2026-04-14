@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "huoyan"
+version = "0.1.0"
+description = "Relay-provider benchmark toolkit for OpenAI-compatible LLM gateways"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "httpx>=0.27.0",
+  "jsonschema>=4.23.0",
+  "pydantic>=2.8.2",
+  "PyYAML>=6.0.2",
+  "tiktoken>=0.9.0",
+]
+
+[project.scripts]
+huoyan = "huoyan.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/huoyan"]
