@@ -275,6 +275,8 @@ async def _rate_limit_transparency_probe(
     observations: list[dict[str, Any]] = []
     saw_429 = False
     saw_headers = False
+    saw_headers_on_429 = False
+    saw_retry_after_on_429 = False
     for attempt in range(3):
         payload = _build_valid_minimal_payload(provider, model.model)
         raw = await client.raw_json_request(payload=payload, timeout_seconds=settings.request_timeout_seconds)
@@ -283,6 +285,10 @@ async def _rate_limit_transparency_probe(
             saw_headers = True
         if raw.status_code == 429:
             saw_429 = True
+            if rate_headers:
+                saw_headers_on_429 = True
+            if "retry-after" in rate_headers:
+                saw_retry_after_on_429 = True
         observations.append(
             {
                 "attempt": attempt + 1,
@@ -293,15 +299,18 @@ async def _rate_limit_transparency_probe(
         )
         await asyncio.sleep(0.2)
 
-    if saw_429 and not saw_headers:
+    if saw_429 and not saw_headers_on_429:
         status = ProbeStatus.FAIL
-        summary = "Rate limiting occurred but no transparent Retry-After or x-ratelimit-* metadata was exposed."
+        summary = "Rate limiting occurred but the 429 responses did not expose Retry-After or x-ratelimit-* metadata."
+    elif saw_429 and saw_headers_on_429:
+        status = ProbeStatus.PASS
+        summary = "Rate limiting was triggered and the 429 responses exposed rate-limit metadata."
     elif saw_headers:
         status = ProbeStatus.PASS
-        summary = "Observed rate-limit metadata in response headers."
+        summary = "Observed proactive rate-limit metadata in non-429 responses."
     else:
-        status = ProbeStatus.WARN
-        summary = "No rate-limit metadata was observed in sampled responses."
+        status = ProbeStatus.SKIP
+        summary = "Rate limiting was not triggered and no proactive metadata was observed, so transparency could not be evaluated."
 
     return _result(
         probe="rate_limit_transparency",
@@ -311,6 +320,8 @@ async def _rate_limit_transparency_probe(
             "sampled_requests": len(observations),
             "saw_429": saw_429,
             "saw_rate_limit_headers": saw_headers,
+            "saw_rate_limit_headers_on_429": saw_headers_on_429,
+            "saw_retry_after_on_429": saw_retry_after_on_429,
         },
         evidence={"observations": observations},
         started_at=started,
@@ -343,23 +354,21 @@ async def _security_headers_probe(provider: ProviderTarget) -> ProbeResult:
     observed = {
         "strict-transport-security": headers.get("strict-transport-security"),
         "x-content-type-options": headers.get("x-content-type-options"),
-        "x-frame-options": headers.get("x-frame-options"),
-        "content-security-policy": headers.get("content-security-policy"),
-        "referrer-policy": headers.get("referrer-policy"),
-        "access-control-allow-origin": headers.get("access-control-allow-origin"),
     }
     hsts = observed["strict-transport-security"] is not None
     xcto = observed["x-content-type-options"] is not None
-    csp = observed["content-security-policy"] is not None
     if hsts and xcto:
         status = ProbeStatus.PASS
-        summary = "Core HTTP security headers are present."
-    elif hsts or xcto or csp:
+        summary = "Core API-relevant HTTP security headers are present."
+    elif response.status_code in {404, 405}:
+        status = ProbeStatus.SKIP
+        summary = f"Sampled API endpoint returned HTTP {response.status_code}; header coverage is inconclusive for a pure API surface."
+    elif hsts or xcto:
         status = ProbeStatus.WARN
-        summary = "Some HTTP security headers are present, but the set is incomplete."
+        summary = "Some API-relevant HTTP security headers are present, but the core set is incomplete."
     else:
         status = ProbeStatus.WARN
-        summary = "No obvious HTTP security headers were observed on the sampled endpoint."
+        summary = "No API-relevant HTTP security headers were observed on the sampled endpoint."
 
     return _result(
         probe="security_headers",

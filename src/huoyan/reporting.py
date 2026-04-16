@@ -232,14 +232,15 @@ def _focus_rows(model: ModelReport) -> list[tuple[str, str, str, str]]:
 
     response_consistency = _find_result(model, "response_consistency")
     if response_consistency:
-        rows.append(("输出一致性", _fmt_float(response_consistency.metrics.get("average_similarity"), 4), _status_label(response_consistency.status.value), _summary_cn(response_consistency)))
+        rows.append(("输出一致性", _fmt_pct(response_consistency.metrics.get("average_anchor_coverage")), _status_label(response_consistency.status.value), _summary_cn(response_consistency)))
 
     ttft = _find_result(model, "ttft_tps")
     if ttft:
         rows.append(("首字回复延迟（TTFT）", f"{_fmt_float(ttft.metrics.get('ttft_seconds'))} s", _status_label(ttft.status.value), _summary_cn(ttft)))
         rows.append(("首字回复延迟 P90", f"{_fmt_float((ttft.metrics.get('ttft_stats_seconds') or {}).get('p90'))} s", "观测值", "多次流式采样后首次回复延迟的 P90。"))
         rows.append(("首正文延迟（TTFC）", f"{_fmt_float(ttft.metrics.get('first_content_seconds'))} s", "观测值", "从开始请求到首个正文内容 token 出现的时间。"))
-        rows.append(("相邻 Token 延迟（ITL）", f"{_fmt_float(ttft.metrics.get('inter_token_latency_ms'))} ms", "观测值", "相邻 token 间平均延迟，近似按生成阶段耗时估算。"))
+        rows.append(("相邻内容事件延迟", f"{_fmt_float(ttft.metrics.get('inter_event_latency_ms'))} ms", "观测值", "按实际流式正文事件到达时间差统计。"))
+        rows.append(("估算相邻 Token 延迟（ITL）", f"{_fmt_float(ttft.metrics.get('inter_token_latency_ms'))} ms", "观测值", "按生成阶段总耗时估算，仅供参考。"))
         rows.append(("请求总时延", f"{_fmt_float(ttft.metrics.get('request_latency_ms'))} ms", "观测值", "单次请求从发起到完整结束的总时延。"))
         rows.append(("流式采样次数", str(ttft.metrics.get("sample_count", "-")), "观测值", "当前性能探针的重复采样次数。"))
         rows.append(("输入序列长度", str(ttft.metrics.get("input_sequence_length", "-")), "观测值", "优先使用 API usage.input_tokens / prompt_tokens。"))
@@ -367,7 +368,7 @@ def _brief_metric_value(result: ProbeResult) -> str:
     if probe == "linguistic_fingerprint":
         return _fmt_ratio(metrics.get("signal_hits"), 3)
     if probe == "response_consistency":
-        return f"相似度 {_fmt_float(metrics.get('average_similarity'), 4)}"
+        return f"锚点覆盖 {_fmt_pct(metrics.get('average_anchor_coverage'))}"
     return "-"
 
 
@@ -420,7 +421,10 @@ def _performance_breakdown_lines(model: ModelReport) -> list[str]:
         lines.append("| 指标 | 结果 | 状态 | 说明 |")
         lines.append("| --- | --- | --- | --- |")
         lines.append(
-            f"| 相邻 Token 延迟（ITL） | {_fmt_float(ttft.metrics.get('inter_token_latency_ms'))} ms | 观测值 | 近似按生成阶段耗时估算。 |"
+            f"| 相邻内容事件延迟 | {_fmt_float(ttft.metrics.get('inter_event_latency_ms'))} ms | 观测值 | 按实际流式正文事件到达时间差统计。 |"
+        )
+        lines.append(
+            f"| 估算相邻 Token 延迟（ITL） | {_fmt_float(ttft.metrics.get('inter_token_latency_ms'))} ms | 观测值 | 按生成阶段总耗时估算，仅供参考。 |"
         )
         lines.append(
             f"| 输出 Token 吞吐 | {_fmt_float(ttft.metrics.get('output_token_throughput_per_second'))} tok/s | 观测值 | 生成阶段的输出 token 吞吐。 |"

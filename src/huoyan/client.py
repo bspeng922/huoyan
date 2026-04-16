@@ -35,6 +35,7 @@ class StreamResponse(BaseModel):
     ttft_seconds: float | None = None
     first_content_seconds: float | None = None
     generation_seconds: float | None = None
+    content_event_offsets_seconds: list[float] = Field(default_factory=list)
     headers: dict[str, str] = Field(default_factory=dict)
 
 
@@ -380,6 +381,7 @@ class OpenAICompatClient:
         usage: dict[str, Any] = {}
         ttft_seconds: float | None = None
         first_content_seconds: float | None = None
+        content_event_offsets_seconds: list[float] = []
         status_code = 200
         headers: dict[str, str] = {}
         pending_event: str | None = None
@@ -426,6 +428,8 @@ class OpenAICompatClient:
                             ttft_seconds = perf_counter() - started
                         if delta_content and first_content_seconds is None:
                             first_content_seconds = perf_counter() - started
+                        if delta_content:
+                            content_event_offsets_seconds.append(perf_counter() - started)
                         output_parts.append(delta_content)
                     elif isinstance(delta_content, list):
                         joined = "".join(
@@ -437,6 +441,8 @@ class OpenAICompatClient:
                             ttft_seconds = perf_counter() - started
                         if joined and first_content_seconds is None:
                             first_content_seconds = perf_counter() - started
+                        if joined:
+                            content_event_offsets_seconds.append(perf_counter() - started)
                         output_parts.append(joined)
                     if chunk.get("usage"):
                         usage = chunk["usage"]
@@ -454,6 +460,7 @@ class OpenAICompatClient:
                             ttft_seconds = perf_counter() - started
                         if first_content_seconds is None:
                             first_content_seconds = perf_counter() - started
+                        content_event_offsets_seconds.append(perf_counter() - started)
                         output_parts.append(delta_text)
 
                 else:
@@ -466,6 +473,8 @@ class OpenAICompatClient:
                                 ttft_seconds = perf_counter() - started
                             if text and first_content_seconds is None:
                                 first_content_seconds = perf_counter() - started
+                            if text:
+                                content_event_offsets_seconds.append(perf_counter() - started)
                             output_parts.append(text)
                     elif event_type == "message_delta":
                         usage = chunk.get("usage", {}) or usage
@@ -501,6 +510,7 @@ class OpenAICompatClient:
             ttft_seconds=ttft_seconds,
             first_content_seconds=first_content_seconds,
             generation_seconds=generation_seconds,
+            content_event_offsets_seconds=content_event_offsets_seconds,
             headers=headers,
         )
 

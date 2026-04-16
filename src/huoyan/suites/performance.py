@@ -45,13 +45,14 @@ def _result(*, probe: str, status: ProbeStatus, summary: str, metrics: dict[str,
 def _stats(values: list[float]) -> dict[str, float | None]:
     if not values:
         return {"avg": None, "min": None, "max": None, "p99": None, "p90": None, "p75": None}
+    sample_count = len(values)
     return {
         "avg": round(sum(values) / len(values), 4),
         "min": round(min(values), 4),
         "max": round(max(values), 4),
-        "p99": round(percentile(values, 0.99), 4) if percentile(values, 0.99) is not None else None,
-        "p90": round(percentile(values, 0.90), 4) if percentile(values, 0.90) is not None else None,
-        "p75": round(percentile(values, 0.75), 4) if percentile(values, 0.75) is not None else None,
+        "p99": round(percentile(values, 0.99), 4) if sample_count >= 20 and percentile(values, 0.99) is not None else None,
+        "p90": round(percentile(values, 0.90), 4) if sample_count >= 10 and percentile(values, 0.90) is not None else None,
+        "p75": round(percentile(values, 0.75), 4) if sample_count >= 4 and percentile(values, 0.75) is not None else None,
     }
 
 
@@ -88,11 +89,22 @@ async def _stream_probe(client: OpenAICompatClient, model: ModelTarget, settings
         else:
             output_tokens = api_output_tokens_total or output_token_estimate.get("count")
         output_token_throughput = None
-        inter_token_latency_ms = None
+        inter_token_latency_estimate_ms = None
         if response.generation_seconds and output_tokens:
             output_token_throughput = output_tokens / response.generation_seconds
             if output_tokens > 1:
-                inter_token_latency_ms = (response.generation_seconds / (output_tokens - 1)) * 1000
+                inter_token_latency_estimate_ms = (response.generation_seconds / (output_tokens - 1)) * 1000
+        content_event_offsets = response.content_event_offsets_seconds
+        inter_event_latency_values_ms = [
+            (content_event_offsets[index] - content_event_offsets[index - 1]) * 1000
+            for index in range(1, len(content_event_offsets))
+            if content_event_offsets[index] >= content_event_offsets[index - 1]
+        ]
+        inter_event_latency_ms = (
+            sum(inter_event_latency_values_ms) / len(inter_event_latency_values_ms)
+            if inter_event_latency_values_ms
+            else None
+        )
         request_latency_ms = response.elapsed_seconds * 1000
         request_throughput = 1 / response.elapsed_seconds if response.elapsed_seconds > 0 else None
         reasoning_observed = bool((reasoning_tokens or 0) > 0)
@@ -103,7 +115,9 @@ async def _stream_probe(client: OpenAICompatClient, model: ModelTarget, settings
                 "ttft_seconds": response.ttft_seconds,
                 "first_content_seconds": response.first_content_seconds,
                 "reasoning_observed": reasoning_observed,
-                "inter_token_latency_ms": inter_token_latency_ms,
+                "content_event_count": len(content_event_offsets),
+                "inter_event_latency_ms": inter_event_latency_ms,
+                "inter_token_latency_estimate_ms": inter_token_latency_estimate_ms,
                 "request_latency_ms": request_latency_ms,
                 "generation_seconds": response.generation_seconds,
                 "elapsed_seconds": response.elapsed_seconds,
@@ -125,7 +139,8 @@ async def _stream_probe(client: OpenAICompatClient, model: ModelTarget, settings
 
     ttft_values = [item["ttft_seconds"] for item in samples if item["ttft_seconds"] is not None]
     ttfc_values = [item["first_content_seconds"] for item in samples if item["first_content_seconds"] is not None]
-    itl_values = [item["inter_token_latency_ms"] for item in samples if item["inter_token_latency_ms"] is not None]
+    inter_event_latency_values = [item["inter_event_latency_ms"] for item in samples if item["inter_event_latency_ms"] is not None]
+    itl_estimate_values = [item["inter_token_latency_estimate_ms"] for item in samples if item["inter_token_latency_estimate_ms"] is not None]
     request_latency_values = [item["request_latency_ms"] for item in samples if item["request_latency_ms"] is not None]
     input_length_values = [float(item["input_sequence_length"]) for item in samples if item["input_sequence_length"] is not None]
     output_length_values = [float(item["output_sequence_length"]) for item in samples if item["output_sequence_length"] is not None]
@@ -134,7 +149,8 @@ async def _stream_probe(client: OpenAICompatClient, model: ModelTarget, settings
 
     ttft_stats = _stats(ttft_values)
     ttfc_stats = _stats(ttfc_values)
-    itl_stats = _stats(itl_values)
+    inter_event_latency_stats = _stats(inter_event_latency_values)
+    itl_estimate_stats = _stats(itl_estimate_values)
     request_latency_stats = _stats(request_latency_values)
     input_length_stats = _stats(input_length_values)
     output_length_stats = _stats(output_length_values)
@@ -167,8 +183,11 @@ async def _stream_probe(client: OpenAICompatClient, model: ModelTarget, settings
             "ttft_stats_seconds": ttft_stats,
             "first_content_seconds": ttfc_stats["avg"],
             "first_content_stats_seconds": ttfc_stats,
-            "inter_token_latency_ms": itl_stats["avg"],
-            "inter_token_latency_stats_ms": itl_stats,
+            "content_event_count": round(sum(item["content_event_count"] for item in samples) / len(samples), 2) if samples else None,
+            "inter_event_latency_ms": inter_event_latency_stats["avg"],
+            "inter_event_latency_stats_ms": inter_event_latency_stats,
+            "inter_token_latency_ms": itl_estimate_stats["avg"],
+            "inter_token_latency_stats_ms": itl_estimate_stats,
             "request_latency_ms": request_latency_stats["avg"],
             "request_latency_stats_ms": request_latency_stats,
             "input_sequence_length": int(round(input_length_stats["avg"])) if input_length_stats["avg"] is not None else None,
@@ -188,6 +207,7 @@ async def _stream_probe(client: OpenAICompatClient, model: ModelTarget, settings
             "ttft_threshold_warn_seconds": round(warn_at, 4),
             "ttft_threshold_fail_seconds": round(fail_at, 4),
             "ttft_threshold_mode": threshold_mode,
+            "percentile_sample_note": "p75 requires >=4 samples, p90 >=10, p99 >=20",
         },
         evidence={"sample_outputs": [item["output_excerpt"] for item in samples[:2]]},
         started_at=started,
@@ -272,8 +292,20 @@ async def _concurrency_probe(client: OpenAICompatClient, model: ModelTarget, set
                 "rate_limit_samples": rate_limit_samples[:3],
             }
         )
-    summary = "All configured concurrency levels completed without request loss." if worst_status == ProbeStatus.PASS else "Some concurrency levels showed request loss, throttling, or gateway instability."
-    return _result(probe="concurrency", status=worst_status, summary=summary, metrics={"levels": all_metrics}, started_at=started)
+    saw_429 = any(level.get("status_codes", {}).get("429") for level in all_metrics)
+    if worst_status == ProbeStatus.PASS:
+        summary = "All configured concurrency levels completed without request loss."
+    elif saw_429:
+        summary = "Some concurrency levels were throttled or dropped requests. This does not by itself distinguish relay-side limits from upstream API limits."
+    else:
+        summary = "Some concurrency levels showed request loss or instability."
+    return _result(
+        probe="concurrency",
+        status=worst_status,
+        summary=summary,
+        metrics={"levels": all_metrics, "saw_429": saw_429},
+        started_at=started,
+    )
 
 
 async def _availability_probe(client: OpenAICompatClient, model: ModelTarget, settings: ProbeSettings) -> ProbeResult:

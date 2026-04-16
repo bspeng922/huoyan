@@ -11,7 +11,7 @@ from huoyan.utils import compact_text, developer_keywords, infer_family, usage_i
 
 
 CONSISTENCY_SIGNALS: dict[str, tuple[str, float]] = {
-    "identity": ("weak", 10.0),
+    "identity": ("weak", 5.0),
     "acrostic_constraints": ("medium", 10.0),
     "boundary_reasoning": ("medium", 10.0),
     "linguistic_fingerprint": ("medium", 10.0),
@@ -63,12 +63,14 @@ def _grade_ratio(hit: int, total: int) -> tuple[ProbeStatus, float]:
 def _status_score(result: ProbeResult, band: str) -> float | None:
     if result.status in {ProbeStatus.SKIP, ProbeStatus.ERROR}:
         return None
+    if band == "weak" and result.status == ProbeStatus.WARN:
+        return None
     if result.score is not None:
         return max(0.0, min(1.0, result.score))
     if result.status == ProbeStatus.PASS:
         return 1.0
     if result.status == ProbeStatus.WARN:
-        return 0.5 if band == "weak" else 0.55 if band == "medium" else 0.6
+        return 0.55 if band == "medium" else 0.6
     return 0.0
 
 
@@ -86,8 +88,17 @@ def build_consistency_score_result(results: list[ProbeResult]) -> ProbeResult:
             continue
         score_ratio = _status_score(result, band)
         if score_ratio is None:
-            used_signals.append({"probe": probe, "band": band, "weight": weight, "status": result.status.value, "counted": False})
+            used_signals.append(
+                {
+                    "probe": probe,
+                    "band": band,
+                    "weight": weight,
+                    "status": result.status.value,
+                    "counted": False,
+                }
+            )
             continue
+
         earned = weight * score_ratio
         band_totals[band]["earned"] += earned
         band_totals[band]["max"] += weight
@@ -111,25 +122,25 @@ def build_consistency_score_result(results: list[ProbeResult]) -> ProbeResult:
 
     if normalized is None:
         status = ProbeStatus.SKIP
-        grade = "未评分"
-        summary = "没有足够的信号来计算综合保真度评分。"
+        grade = "not_scored"
+        summary = "Not enough probe signals were available to calculate the consistency score."
     elif coverage_ratio < 0.6:
         status = ProbeStatus.WARN
-        grade = "证据不足"
-        summary = "可用于计算综合保真度的有效信号覆盖率不足，分数仅供参考。"
+        grade = "insufficient_evidence"
+        summary = "Too few probe signals were countable, so the consistency score is only a weak reference."
         reported_score = None
     elif normalized >= 80:
         status = ProbeStatus.PASS
-        grade = "高一致"
-        summary = "跨弱/中/强信号综合判断，当前模型与标称能力画像高度一致。"
+        grade = "high_consistency"
+        summary = "Cross-signal consistency looks strong across weak, medium, and strong indicators."
     elif normalized >= 60:
         status = ProbeStatus.WARN
-        grade = "中等一致"
-        summary = "跨信号综合判断整体仍可接受，但存在需要人工复核的偏差。"
+        grade = "moderate_consistency"
+        summary = "Cross-signal consistency is acceptable, but there are still deviations worth reviewing."
     else:
         status = ProbeStatus.FAIL
-        grade = "低一致"
-        summary = "跨信号综合判断一致性偏低，建议重点复核后端路由与中转实现。"
+        grade = "low_consistency"
+        summary = "Cross-signal consistency is low and the relay path should be reviewed more closely."
 
     return _result(
         probe="consistency_score",
@@ -246,7 +257,7 @@ async def _acrostic_probe(client: OpenAICompatClient, model: ModelTarget, settin
     for idx, line in enumerate(lines[:4]):
         pure = "".join(ch for ch in line if "\u4e00" <= ch <= "\u9fff")
         line_lengths.append(len(pure))
-        if idx < 4 and pure.startswith(expected_heads[idx]) and len(pure) == 7:
+        if pure.startswith(expected_heads[idx]) and len(pure) == 7:
             hit += 1
     status, score = _grade_ratio(hit, 4)
     summary = "Acrostic and character-count constraints fully satisfied." if status == ProbeStatus.PASS else f"Only {hit}/4 lines satisfied the acrostic constraints."
@@ -280,7 +291,8 @@ def _normalize_consistency_text(text: str) -> str:
     cleaned = text.strip().strip("`")
     cleaned = cleaned.replace("```", "")
     cleaned = cleaned.replace("\r", "")
-    cleaned = "".join(ch for ch in cleaned if ch not in " \n\t，。；：、“”‘’（）()[]【】<>《》-—_`'")
+    drop_chars = " \n\t，。；：、“”‘’（）()[]【】<>《》-—`'\""
+    cleaned = "".join(ch for ch in cleaned if ch not in drop_chars)
     return cleaned
 
 
@@ -298,7 +310,7 @@ async def _response_consistency_probe(client: OpenAICompatClient, model: ModelTa
                 model=model.model,
                 messages=[{"role": "user", "content": prompt}],
                 timeout_seconds=settings.request_timeout_seconds,
-                temperature=0,
+                temperature=0.2,
                 max_tokens=min(settings.completion_max_tokens, 180),
             )
             raw_responses.append(response.content)
@@ -314,9 +326,9 @@ async def _response_consistency_probe(client: OpenAICompatClient, model: ModelTa
     min_similarity = min(similarities) if similarities else None
 
     anchor_groups = [
-        ["syn", "同步"],
-        ["ack", "确认"],
-        ["历史连接", "旧连接", "过期报文", "重复报文"],
+        ["syn", "同步", "序列号"],
+        ["ack", "确认", "应答"],
+        ["历史连接", "旧连接", "过期报文", "重复报文", "误连"],
     ]
     anchor_hits = 0
     merged = " ".join(raw_responses).lower()
@@ -324,22 +336,39 @@ async def _response_consistency_probe(client: OpenAICompatClient, model: ModelTa
         if any(anchor.lower() in merged for anchor in group):
             anchor_hits += 1
 
+    per_response_anchor_hits: list[int] = []
+    for response_text in raw_responses:
+        lowered = response_text.lower()
+        hit_count = 0
+        for group in anchor_groups:
+            if any(anchor.lower() in lowered for anchor in group):
+                hit_count += 1
+        per_response_anchor_hits.append(hit_count)
+
+    average_anchor_coverage = (
+        sum(per_response_anchor_hits) / (len(per_response_anchor_hits) * len(anchor_groups))
+        if per_response_anchor_hits
+        else None
+    )
+    complete_responses = sum(1 for hit_count in per_response_anchor_hits if hit_count == len(anchor_groups))
+    min_anchor_hits = min(per_response_anchor_hits) if per_response_anchor_hits else None
+
     if avg_similarity is None:
         status = ProbeStatus.ERROR
         score = 0.0
         summary = "Unable to compute response consistency similarity."
-    elif avg_similarity >= 0.9 and anchor_hits == len(anchor_groups):
+    elif complete_responses == len(raw_responses):
         status = ProbeStatus.PASS
-        score = 1.0
-        summary = "Repeated deterministic prompts produced highly consistent outputs."
-    elif avg_similarity >= 0.7:
+        score = 1.0 if average_anchor_coverage is None else average_anchor_coverage
+        summary = "Repeated prompts preserved the expected semantic anchors across all sampled responses."
+    elif average_anchor_coverage is not None and average_anchor_coverage >= 0.75:
         status = ProbeStatus.WARN
-        score = avg_similarity
-        summary = "Repeated deterministic prompts showed some style or content drift."
+        score = average_anchor_coverage
+        summary = "Repeated prompts preserved most semantic anchors, but some sampled responses drifted."
     else:
         status = ProbeStatus.FAIL
-        score = avg_similarity
-        summary = "Repeated deterministic prompts showed large output drift."
+        score = average_anchor_coverage if average_anchor_coverage is not None else 0.0
+        summary = "Repeated prompts missed key semantic anchors, so the responses were not stable enough."
 
     return _result(
         probe="response_consistency",
@@ -352,6 +381,10 @@ async def _response_consistency_probe(client: OpenAICompatClient, model: ModelTa
             "min_similarity": round(min_similarity, 4) if min_similarity is not None else None,
             "anchor_group_hits": anchor_hits,
             "anchor_group_total": len(anchor_groups),
+            "per_response_anchor_hits": per_response_anchor_hits,
+            "complete_response_count": complete_responses,
+            "average_anchor_coverage": round(average_anchor_coverage, 4) if average_anchor_coverage is not None else None,
+            "min_anchor_hits_per_response": min_anchor_hits,
         },
         evidence={"responses": [compact_text(text, limit=500) for text in raw_responses]},
         started_at=started,
@@ -433,7 +466,11 @@ async def _linguistic_fingerprint_probe(client: OpenAICompatClient, model: Model
         status=status,
         summary=summary,
         score=score,
-        metrics={"signal_hits": hit, "api_input_tokens": usage_input_tokens(response.usage), "api_output_tokens": usage_output_tokens(response.usage)},
+        metrics={
+            "signal_hits": hit,
+            "api_input_tokens": usage_input_tokens(response.usage),
+            "api_output_tokens": usage_output_tokens(response.usage),
+        },
         evidence={"response_excerpt": compact_text(response.content)},
         started_at=started,
     )
