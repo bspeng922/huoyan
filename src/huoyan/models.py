@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, Field
+from huoyan.utils import local_now
 
 
 class ProbeStatus(str, Enum):
@@ -23,8 +24,8 @@ class ProbeResult(BaseModel):
     score: float | None = None
     metrics: dict[str, Any] = Field(default_factory=dict)
     evidence: dict[str, Any] = Field(default_factory=dict)
-    started_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    finished_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    started_at: datetime = Field(default_factory=local_now)
+    finished_at: datetime = Field(default_factory=local_now)
 
 
 class ModelReport(BaseModel):
@@ -48,8 +49,9 @@ class ProviderReport(BaseModel):
 
 
 class RunReport(BaseModel):
-    generated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    generated_at: datetime = Field(default_factory=local_now)
     overall_status: ProbeStatus
     summary: dict[str, int]
     providers: list[ProviderReport]
+    metadata: dict[str, Any] = Field(default_factory=dict)
     audit_log_entries: list[dict[str, Any]] = Field(default_factory=list)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from time import perf_counter
 from typing import Any
@@ -8,6 +9,7 @@ import httpx
 from pydantic import BaseModel, Field
 
 from huoyan.config import ProviderTarget
+from huoyan.logging_utils import get_logger
 from huoyan.utils import (
     extract_message_text,
     redact_sensitive_data,
@@ -15,6 +17,8 @@ from huoyan.utils import (
     sha256_text,
     stable_json_dumps,
 )
+
+logger = get_logger(__name__)
 
 
 class ChatResponse(BaseModel):
@@ -56,12 +60,19 @@ class OpenAICompatClient:
 
     async def __aenter__(self) -> "OpenAICompatClient":
         self._client = httpx.AsyncClient(timeout=None)
+        logger.info(
+            "HTTP client opened provider=%s api_style=%s endpoint=%s",
+            self.provider.name,
+            self.provider.api_style,
+            self.endpoint,
+        )
         return self
 
     async def __aexit__(self, *_: object) -> None:
         if self._client is not None:
             await self._client.aclose()
             self._client = None
+            logger.info("HTTP client closed provider=%s", self.provider.name)
 
     @property
     def endpoint(self) -> str:
@@ -131,6 +142,12 @@ class OpenAICompatClient:
         if isinstance(error, dict) and error.get("message"):
             message = str(error.get("message"))
             code = error.get("code")
+            logger.warning(
+                "Embedded API error provider=%s code=%s message=%s",
+                self.provider.name,
+                code,
+                message,
+            )
             raise RuntimeError(f"Embedded API error: {code} {message}".strip())
 
         base_resp = raw.get("base_resp")
@@ -138,6 +155,12 @@ class OpenAICompatClient:
             status_code = base_resp.get("status_code")
             if status_code not in {None, 0, 200, "0", "200"}:
                 status_msg = str(base_resp.get("status_msg", "")).strip()
+                logger.warning(
+                    "Embedded upstream error provider=%s status_code=%s status_msg=%s",
+                    self.provider.name,
+                    status_code,
+                    status_msg,
+                )
                 raise RuntimeError(f"Embedded upstream error: {status_code} {status_msg}".strip())
 
     def _split_system_messages(
@@ -198,6 +221,39 @@ class OpenAICompatClient:
                     item_type = item.get("type")
                     if item_type == "text":
                         blocks.append({"type": "text", "text": item.get("text", "")})
+                    elif item_type == "image_url":
+                        image_url = item.get("image_url")
+                        if isinstance(image_url, dict):
+                            image_url = image_url.get("url")
+                        if not image_url:
+                            continue
+                        if str(image_url).startswith("data:"):
+                            try:
+                                header, encoded = str(image_url).split(",", 1)
+                                media_type = header[5:].split(";")[0] or "image/png"
+                                base64.b64decode(encoded, validate=True)
+                            except Exception:
+                                continue
+                            blocks.append(
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": media_type,
+                                        "data": encoded,
+                                    },
+                                }
+                            )
+                        else:
+                            blocks.append(
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "url",
+                                        "url": str(image_url),
+                                    },
+                                }
+                            )
                 converted.append({"role": role, "content": blocks})
                 continue
 
@@ -332,6 +388,12 @@ class OpenAICompatClient:
             raise RuntimeError("Client is not initialized.")
 
         payload = self._build_payload(model=model, messages=messages, stream=False, extra=extra)
+        logger.debug(
+            "Sending chat completion provider=%s model=%s timeout=%s",
+            self.provider.name,
+            model,
+            timeout_seconds,
+        )
         started = perf_counter()
         response = await self._client.post(
             self.endpoint,
@@ -354,6 +416,13 @@ class OpenAICompatClient:
             model=model,
             headers=dict(response.headers),
         )
+        logger.debug(
+            "Chat completion finished provider=%s model=%s status_code=%s elapsed_seconds=%.3f",
+            self.provider.name,
+            model,
+            response.status_code,
+            elapsed,
+        )
         return ChatResponse(
             content=extract_message_text(raw),
             raw=raw,
@@ -375,6 +444,12 @@ class OpenAICompatClient:
             raise RuntimeError("Client is not initialized.")
 
         payload = self._build_payload(model=model, messages=messages, stream=True, extra=extra)
+        logger.debug(
+            "Sending stream completion provider=%s model=%s timeout=%s",
+            self.provider.name,
+            model,
+            timeout_seconds,
+        )
         started = perf_counter()
         output_parts: list[str] = []
         raw_chunks: list[dict[str, Any]] = []
@@ -501,6 +576,13 @@ class OpenAICompatClient:
             model=model,
             headers=headers,
         )
+        logger.debug(
+            "Stream completion finished provider=%s model=%s status_code=%s elapsed_seconds=%.3f",
+            self.provider.name,
+            model,
+            status_code,
+            elapsed,
+        )
         return StreamResponse(
             content="".join(output_parts),
             raw_chunks=raw_chunks,
@@ -524,6 +606,12 @@ class OpenAICompatClient:
             raise RuntimeError("Client is not initialized.")
 
         started = perf_counter()
+        logger.debug(
+            "Sending raw JSON request provider=%s model=%s timeout=%s",
+            self.provider.name,
+            payload.get("model", ""),
+            timeout_seconds,
+        )
         response = await self._client.post(
             self.endpoint,
             headers=self.headers,
@@ -548,6 +636,13 @@ class OpenAICompatClient:
             mode="raw_json_request",
             model=str(payload.get("model", "")),
             headers=dict(response.headers),
+        )
+        logger.debug(
+            "Raw JSON request finished provider=%s model=%s status_code=%s elapsed_seconds=%.3f",
+            self.provider.name,
+            payload.get("model", ""),
+            response.status_code,
+            elapsed,
         )
         return RawHTTPResponse(
             status_code=response.status_code,

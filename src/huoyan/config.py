@@ -6,6 +6,8 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, PositiveFloat, PositiveInt, SecretStr
 
+from huoyan.logging_utils import get_logger
+
 
 SuiteName = Literal[
     "authenticity",
@@ -15,6 +17,8 @@ SuiteName = Literal[
     "security_audit",
 ]
 APIStyle = Literal["openai-chat", "openai-responses", "anthropic-messages"]
+
+logger = get_logger(__name__)
 
 
 class ProbeSettings(BaseModel):
@@ -31,13 +35,13 @@ class ProbeSettings(BaseModel):
     request_timeout_seconds: PositiveFloat = 60
     completion_max_tokens: PositiveInt = 256
     stream_max_tokens: PositiveInt = 512
-    performance_stream_samples: PositiveInt = 5
-    performance_stream_sample_interval_seconds: float = 0.5
-    concurrency_levels: list[PositiveInt] = Field(default_factory=lambda: [5])
+    performance_stream_samples: PositiveInt = 10
+    performance_stream_sample_interval_seconds: float = 1.0
+    concurrency_levels: list[PositiveInt] = Field(default_factory=lambda: [5, 10])
     uptime_samples: PositiveInt = 5
     uptime_interval_seconds: float = 1.0
     long_context_target_chars: PositiveInt = 20000
-    security_warmup_requests: PositiveInt = 3
+    security_warmup_requests: PositiveInt = 10
     security_retry_attempts: PositiveInt = 3
     security_retry_backoff_seconds: PositiveFloat = 3.0
     multimodal_image_url: str | None = None
@@ -103,11 +107,24 @@ class AppConfig(BaseModel):
 
 def load_config(path: str | Path) -> AppConfig:
     config_path = Path(path)
+    logger.info("Loading config path=%s", config_path.resolve())
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    return AppConfig.model_validate(raw)
+    config = AppConfig.model_validate(raw)
+    logger.info(
+        "Config loaded providers=%s output_dir=%s",
+        len(config.providers),
+        config.report.output_dir,
+    )
+    return config
 
 
 def merge_settings(base: ProbeSettings, override: ProbeSettingsOverride) -> ProbeSettings:
     merged = base.model_dump()
     merged.update(override.model_dump(exclude_none=True))
-    return ProbeSettings.model_validate(merged)
+    settings = ProbeSettings.model_validate(merged)
+    logger.debug(
+        "Merged settings suites=%s timeout=%s",
+        ",".join(settings.enabled_suites),
+        settings.request_timeout_seconds,
+    )
+    return settings

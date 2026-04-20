@@ -9,11 +9,13 @@ description = "Relay-provider benchmark toolkit for OpenAI-compatible LLM gatewa
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+  "fastapi>=0.115.0",
   "httpx>=0.27.0",
   "jsonschema>=4.23.0",
   "pydantic>=2.8.2",
   "PyYAML>=6.0.2",
   "tiktoken>=0.9.0",
+  "uvicorn>=0.30.0",
 ]
 
 [project.scripts]

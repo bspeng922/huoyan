@@ -7,7 +7,8 @@ from typing import Any
 from huoyan.client import OpenAICompatClient
 from huoyan.config import ModelTarget, ProbeSettings
 from huoyan.models import ProbeResult, ProbeStatus
-from huoyan.utils import estimate_prompt_tokens, estimate_text_tokens, infer_family, percentile, usage_input_tokens, usage_output_tokens, usage_reasoning_tokens, utc_now
+from huoyan.progress import ProgressCallback, run_probe_sequence
+from huoyan.utils import estimate_prompt_tokens, estimate_text_tokens, infer_family, local_now, percentile, usage_input_tokens, usage_output_tokens, usage_reasoning_tokens
 
 
 TTFT_THRESHOLDS: dict[str, tuple[float, float]] = {
@@ -37,8 +38,8 @@ def _result(*, probe: str, status: ProbeStatus, summary: str, metrics: dict[str,
         summary=summary,
         metrics=metrics or {},
         evidence=evidence or {},
-        started_at=started_at or utc_now(),
-        finished_at=utc_now(),
+        started_at=started_at or local_now(),
+        finished_at=local_now(),
     )
 
 
@@ -56,12 +57,20 @@ def _stats(values: list[float]) -> dict[str, float | None]:
     }
 
 
+def _preferred_stat(stats: dict[str, float | None]) -> tuple[str | None, float | None]:
+    for basis in ["p90", "p75", "avg"]:
+        value = stats.get(basis)
+        if value is not None:
+            return basis, value
+    return None, None
+
+
 async def _stream_probe(client: OpenAICompatClient, model: ModelTarget, settings: ProbeSettings) -> ProbeResult:
-    started = utc_now()
+    started = local_now()
     if not model.supports_stream:
         return _result(probe="ttft_tps", status=ProbeStatus.SKIP, summary="Model is marked as not supporting stream output.", started_at=started)
 
-    prompt = "请连续输出 450 到 550 个汉字，主题是“大模型网关压测观察”，内容要自然连贯，不要分点，不要标题。"
+    prompt = "请连续输出 180 到 220 个汉字，主题是“大模型网关压测观察”，内容要自然连贯，不要分点，不要标题。"
     messages = [{"role": "user", "content": prompt}]
     family = infer_family(model.model, model.claimed_family)
     input_token_estimate = estimate_prompt_tokens(messages, model.model, family)
@@ -159,19 +168,20 @@ async def _stream_probe(client: OpenAICompatClient, model: ModelTarget, settings
 
     reasoning_observed = any(bool(item.get("reasoning_observed")) for item in samples)
     warn_at, fail_at, threshold_mode = _ttft_thresholds(family, reasoning_observed)
-    observed_ttft = ttft_stats["p90"] if ttft_stats["p90"] is not None else ttft_stats["avg"]
+    ttft_stat_basis, observed_ttft = _preferred_stat(ttft_stats)
+    basis_label = ttft_stat_basis or "observed"
     if observed_ttft is None:
         status = ProbeStatus.WARN
         summary = "No first-reply timestamp was captured from the sampled streams."
     elif observed_ttft >= fail_at:
         status = ProbeStatus.FAIL
-        summary = f"TTFT p90 {observed_ttft:.2f}s exceeded the fail threshold {fail_at:.2f}s for {family}."
+        summary = f"TTFT {basis_label} {observed_ttft:.2f}s exceeded the fail threshold {fail_at:.2f}s for {family}."
     elif observed_ttft >= warn_at:
         status = ProbeStatus.WARN
-        summary = f"TTFT p90 {observed_ttft:.2f}s exceeded the warning threshold {warn_at:.2f}s for {family}."
+        summary = f"TTFT {basis_label} {observed_ttft:.2f}s exceeded the warning threshold {warn_at:.2f}s for {family}."
     else:
         status = ProbeStatus.PASS
-        summary = f"TTFT p90 {observed_ttft:.2f}s is within the expected range for {family}."
+        summary = f"TTFT {basis_label} {observed_ttft:.2f}s is within the expected range for {family}."
 
     return _result(
         probe="ttft_tps",
@@ -204,6 +214,8 @@ async def _stream_probe(client: OpenAICompatClient, model: ModelTarget, settings
             "request_throughput_stats_per_second": request_tput_stats,
             "tokens_per_second": output_tput_stats["avg"],
             "reasoning_observed": reasoning_observed,
+            "ttft_observed_seconds": observed_ttft,
+            "ttft_observed_basis": ttft_stat_basis,
             "ttft_threshold_warn_seconds": round(warn_at, 4),
             "ttft_threshold_fail_seconds": round(fail_at, 4),
             "ttft_threshold_mode": threshold_mode,
@@ -251,7 +263,7 @@ async def _single_concurrency_call(client: OpenAICompatClient, model_name: str, 
 
 
 async def _concurrency_probe(client: OpenAICompatClient, model: ModelTarget, settings: ProbeSettings) -> ProbeResult:
-    started = utc_now()
+    started = local_now()
     all_metrics: list[dict[str, Any]] = []
     worst_status = ProbeStatus.PASS
     status_rank = {ProbeStatus.PASS: 0, ProbeStatus.SKIP: 1, ProbeStatus.WARN: 2, ProbeStatus.FAIL: 3, ProbeStatus.ERROR: 4}
@@ -309,7 +321,7 @@ async def _concurrency_probe(client: OpenAICompatClient, model: ModelTarget, set
 
 
 async def _availability_probe(client: OpenAICompatClient, model: ModelTarget, settings: ProbeSettings) -> ProbeResult:
-    started = utc_now()
+    started = local_now()
     samples: list[dict[str, Any]] = []
     for index in range(settings.uptime_samples):
         result = await _single_concurrency_call(client, model.model, settings.request_timeout_seconds)
@@ -318,15 +330,43 @@ async def _availability_probe(client: OpenAICompatClient, model: ModelTarget, se
         if index + 1 < settings.uptime_samples and settings.uptime_interval_seconds > 0:
             await asyncio.sleep(settings.uptime_interval_seconds)
     success_count = sum(1 for item in samples if item.get("ok"))
+    failure_count = len(samples) - success_count
     availability = success_count / len(samples)
-    if availability == 1.0:
-        status, summary = ProbeStatus.PASS, "Short-window availability sampling completed with no failures."
-    elif availability >= 0.95:
-        status, summary = ProbeStatus.WARN, "Short-window availability sampling showed intermittent failures."
+    sample_window_seconds = settings.uptime_interval_seconds * max(settings.uptime_samples - 1, 0)
+    if failure_count == 0:
+        status, summary = ProbeStatus.PASS, "Short-window availability sampling completed with no failures. This is a brief health snapshot, not an SLA."
+    elif failure_count == 1:
+        status, summary = ProbeStatus.WARN, "Short-window availability sampling showed intermittent failures. Treat this as a brief health snapshot, not a long-term availability claim."
     else:
-        status, summary = ProbeStatus.FAIL, "Short-window availability sampling showed frequent failures."
-    return _result(probe="availability", status=status, summary=summary, metrics={"availability_ratio": round(availability, 4), "samples": samples}, started_at=started)
+        status, summary = ProbeStatus.FAIL, "Short-window availability sampling showed frequent failures within the sampled window."
+    return _result(
+        probe="availability",
+        status=status,
+        summary=summary,
+        metrics={
+            "availability_ratio": round(availability, 4),
+            "failure_count": failure_count,
+            "sample_count": settings.uptime_samples,
+            "sample_interval_seconds": settings.uptime_interval_seconds,
+            "sample_window_seconds": round(sample_window_seconds, 4),
+            "samples": samples,
+        },
+        started_at=started,
+    )
 
 
-async def run_performance_suite(client: OpenAICompatClient, model: ModelTarget, settings: ProbeSettings) -> list[ProbeResult]:
-    return [await _stream_probe(client, model, settings), await _concurrency_probe(client, model, settings), await _availability_probe(client, model, settings)]
+async def run_performance_suite(
+    client: OpenAICompatClient,
+    model: ModelTarget,
+    settings: ProbeSettings,
+    progress_callback: ProgressCallback | None = None,
+) -> list[ProbeResult]:
+    return await run_probe_sequence(
+        suite="performance",
+        progress_callback=progress_callback,
+        steps=[
+            ("ttft_tps", lambda: _stream_probe(client, model, settings)),
+            ("concurrency", lambda: _concurrency_probe(client, model, settings)),
+            ("availability", lambda: _availability_probe(client, model, settings)),
+        ],
+    )

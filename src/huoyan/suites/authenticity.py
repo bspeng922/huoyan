@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 from difflib import SequenceMatcher
 from typing import Any
@@ -7,23 +8,119 @@ from typing import Any
 from huoyan.client import OpenAICompatClient
 from huoyan.config import ModelTarget, ProbeSettings, ProviderTarget
 from huoyan.models import ProbeResult, ProbeStatus
-from huoyan.utils import compact_text, developer_keywords, infer_family, usage_input_tokens, usage_output_tokens, utc_now
+from huoyan.progress import ProgressCallback, run_probe_sequence
+from huoyan.utils import compact_text, developer_keywords, infer_family, local_now, usage_input_tokens, usage_output_tokens
 
 
-CONSISTENCY_SIGNALS: dict[str, tuple[str, float]] = {
-    "identity": ("weak", 5.0),
-    "acrostic_constraints": ("medium", 10.0),
-    "boundary_reasoning": ("medium", 10.0),
-    "linguistic_fingerprint": ("medium", 10.0),
-    "response_consistency": ("medium", 10.0),
-    "token_alignment": ("medium", 10.0),
-    "tool_calling": ("strong", 15.0),
-    "long_context_integrity": ("strong", 15.0),
-    "stream_integrity": ("strong", 10.0),
-    "error_response_leakage": ("strong", 10.0),
-    "system_prompt_injection": ("strong", 10.0),
+CAPABILITY_CHALLENGES: list[dict[str, Any]] = [
+    {
+        "id": "logical_deduction",
+        "question": (
+            "已知：甲班所有学生都参加了数学竞赛；李明没有参加数学竞赛。"
+            "请回答：李明是甲班学生吗？只回答「是」或「不是」。"
+        ),
+        "answer": "不是",
+        "verify": "keyword",
+    },
+    {
+        "id": "arithmetic_tracking",
+        "question": (
+            "小明有 15 个苹果，给了小红 3 个，又从小华那里得到 1 个，然后给了小刚 2 个。"
+            "小明现在有几个苹果？只输出数字。"
+        ),
+        "answer": 11,
+        "verify": "number",
+    },
+    {
+        "id": "code_reference",
+        "question": (
+            "执行以下 Python 代码后，len(x) + len(y) 的值是多少？只输出数字。\n"
+            "x = [1, 2, 3]\ny = x\nx.append(4)\ny.append(5)"
+        ),
+        "answer": 10,
+        "verify": "number",
+    },
+    {
+        "id": "multi_step_math",
+        "question": (
+            "一个水池有三根管：A 管单独注满需 3 小时，B 管单独注满需 4 小时，"
+            "C 管单独排空需 6 小时。三管同时打开，多少小时注满？"
+            "只输出数字，保留一位小数。"
+        ),
+        "answer": 2.4,
+        "verify": "approximate",
+    },
+    {
+        "id": "pattern_completion",
+        "question": "数列 2, 6, 18, 54, _ 的下一项是什么？只输出数字。",
+        "answer": 162,
+        "verify": "number",
+    },
+    {
+        "id": "goal_oriented_transport",
+        "question": (
+            "我想洗车，如果我家离洗车店步行只有50米的脚程，"
+            "你建议我开车去还是走路去？只回答「开车去」或者「走路去」。"
+        ),
+        "answer": "开车去",
+        "verify": "keyword",
+    },
+]
+
+FAMILY_FINGERPRINT_RATIO: dict[str, float] = {
+    "openai": 0.8,
+    "claude": 0.8,
+    "gemini": 0.8,
+    "glm": 0.6,
+    "qwen": 0.6,
+    "deepseek": 0.6,
+    "kimi": 0.6,
 }
-TOTAL_SIGNAL_WEIGHT = sum(weight for _, weight in CONSISTENCY_SIGNALS.values())
+
+
+SCORECARD_DEFINITIONS: dict[str, dict[str, Any]] = {
+    "capability_score": {
+        "scope": "model_capabilities",
+        "probes": {
+            "capability_fingerprint": ("medium", 10.0),
+            "acrostic_constraints": ("medium", 8.0),
+            "boundary_reasoning": ("medium", 10.0),
+            "linguistic_fingerprint": ("medium", 8.0),
+            "response_consistency": ("medium", 12.0),
+            "tool_calling": ("strong", 15.0),
+            "multi_turn_tool": ("strong", 15.0),
+            "long_context_integrity": ("strong", 12.0),
+        },
+        "pass_summary": "Capability probes look coherent across reasoning, structure, tools, and long-context handling.",
+        "warn_summary": "Capability probes are partially coherent, but some behavior drift or feature gaps need review.",
+        "fail_summary": "Capability probes diverge too much to treat this route as a stable capability match.",
+    },
+    "protocol_score": {
+        "scope": "transport_and_usage_protocol",
+        "probes": {
+            "stream_integrity": ("strong", 15.0),
+            "token_alignment": ("medium", 10.0),
+        },
+        "pass_summary": "Protocol-facing probes look healthy across streaming and usage-token reporting.",
+        "warn_summary": "Protocol-facing probes are only partially aligned, or evidence is incomplete.",
+        "fail_summary": "Protocol-facing probes show material transport or usage-accounting inconsistencies.",
+    },
+    "security_score": {
+        "scope": "relay_security_hygiene",
+        "probes": {
+            "dependency_substitution": ("medium", 10.0),
+            "conditional_delivery": ("medium", 10.0),
+            "error_response_leakage": ("strong", 15.0),
+            "tls_baseline": ("medium", 10.0),
+            "security_headers": ("medium", 5.0),
+            "rate_limit_transparency": ("medium", 10.0),
+            "system_prompt_injection": ("strong", 10.0),
+        },
+        "pass_summary": "Relay security hygiene looks healthy across the sampled transport and error-surface probes.",
+        "warn_summary": "Relay security hygiene is mixed, or too few security probes were conclusive.",
+        "fail_summary": "Relay security hygiene is weak across the sampled transport and error-surface probes.",
+    },
+}
 
 
 def _result(
@@ -31,21 +128,22 @@ def _result(
     probe: str,
     status: ProbeStatus,
     summary: str,
+    suite: str = "authenticity",
     metrics: dict[str, Any] | None = None,
     evidence: dict[str, Any] | None = None,
     score: float | None = None,
     started_at=None,
 ) -> ProbeResult:
     return ProbeResult(
-        suite="authenticity",
+        suite=suite,
         probe=probe,
         status=status,
         summary=summary,
         score=score,
         metrics=metrics or {},
         evidence=evidence or {},
-        started_at=started_at or utc_now(),
-        finished_at=utc_now(),
+        started_at=started_at or local_now(),
+        finished_at=local_now(),
     )
 
 
@@ -74,23 +172,25 @@ def _status_score(result: ProbeResult, band: str) -> float | None:
     return 0.0
 
 
-def build_consistency_score_result(results: list[ProbeResult]) -> ProbeResult:
-    started = utc_now()
+def _build_scorecard_result(probe: str, results: list[ProbeResult]) -> ProbeResult:
+    started = local_now()
+    definition = SCORECARD_DEFINITIONS[probe]
     lookup = {result.probe: result for result in results}
     used_signals: list[dict[str, Any]] = []
-    band_totals = {band: {"earned": 0.0, "max": 0.0} for band in ["weak", "medium", "strong"]}
+    band_totals = {band: {"earned": 0.0, "max": 0.0} for band in ["medium", "strong"]}
     total_earned = 0.0
     total_max = 0.0
+    total_possible = sum(weight for _, weight in definition["probes"].values())
 
-    for probe, (band, weight) in CONSISTENCY_SIGNALS.items():
-        result = lookup.get(probe)
+    for source_probe, (band, weight) in definition["probes"].items():
+        result = lookup.get(source_probe)
         if result is None:
             continue
         score_ratio = _status_score(result, band)
         if score_ratio is None:
             used_signals.append(
                 {
-                    "probe": probe,
+                    "probe": source_probe,
                     "band": band,
                     "weight": weight,
                     "status": result.status.value,
@@ -106,7 +206,7 @@ def build_consistency_score_result(results: list[ProbeResult]) -> ProbeResult:
         total_max += weight
         used_signals.append(
             {
-                "probe": probe,
+                "probe": source_probe,
                 "band": band,
                 "weight": weight,
                 "status": result.status.value,
@@ -117,55 +217,60 @@ def build_consistency_score_result(results: list[ProbeResult]) -> ProbeResult:
         )
 
     normalized = (total_earned / total_max * 100.0) if total_max else None
-    coverage_ratio = (total_max / TOTAL_SIGNAL_WEIGHT) if TOTAL_SIGNAL_WEIGHT else 0.0
+    coverage_ratio = (total_max / total_possible) if total_possible else 0.0
     reported_score = round(normalized, 2) if normalized is not None else None
 
     if normalized is None:
         status = ProbeStatus.SKIP
         grade = "not_scored"
-        summary = "Not enough probe signals were available to calculate the consistency score."
+        summary = "Not enough countable probe results were available to calculate this scorecard."
     elif coverage_ratio < 0.6:
         status = ProbeStatus.WARN
         grade = "insufficient_evidence"
-        summary = "Too few probe signals were countable, so the consistency score is only a weak reference."
+        summary = "Too few probe results were countable, so this scorecard is inconclusive."
         reported_score = None
     elif normalized >= 80:
         status = ProbeStatus.PASS
-        grade = "high_consistency"
-        summary = "Cross-signal consistency looks strong across weak, medium, and strong indicators."
+        grade = "high"
+        summary = str(definition["pass_summary"])
     elif normalized >= 60:
         status = ProbeStatus.WARN
-        grade = "moderate_consistency"
-        summary = "Cross-signal consistency is acceptable, but there are still deviations worth reviewing."
+        grade = "moderate"
+        summary = str(definition["warn_summary"])
     else:
         status = ProbeStatus.FAIL
-        grade = "low_consistency"
-        summary = "Cross-signal consistency is low and the relay path should be reviewed more closely."
+        grade = "low"
+        summary = str(definition["fail_summary"])
 
     return _result(
-        probe="consistency_score",
+        probe=probe,
         status=status,
         summary=summary,
+        suite="scorecard",
         score=(reported_score / 100.0) if reported_score is not None else None,
         metrics={
-            "consistency_score": reported_score,
-            "raw_consistency_score": round(normalized, 2) if normalized is not None else None,
+            "score": reported_score,
+            "raw_score": round(normalized, 2) if normalized is not None else None,
             "grade": grade,
             "coverage_ratio": round(coverage_ratio, 4),
             "max_score": round(total_max, 2),
             "earned_score": round(total_earned, 2),
-            "weak_signal_score": round(band_totals["weak"]["earned"], 2),
-            "weak_signal_max": round(band_totals["weak"]["max"], 2),
             "medium_signal_score": round(band_totals["medium"]["earned"], 2),
             "medium_signal_max": round(band_totals["medium"]["max"], 2),
             "strong_signal_score": round(band_totals["strong"]["earned"], 2),
             "strong_signal_max": round(band_totals["strong"]["max"], 2),
             "counted_signal_count": sum(1 for item in used_signals if item["counted"]),
             "skipped_signal_count": sum(1 for item in used_signals if not item["counted"]),
+            "score_kind": probe,
+            "score_scope": definition["scope"],
         },
         evidence={"signals": used_signals},
         started_at=started,
     )
+
+
+def build_scorecard_results(results: list[ProbeResult]) -> list[ProbeResult]:
+    return [_build_scorecard_result(score_probe, results) for score_probe in SCORECARD_DEFINITIONS]
 
 
 async def _identity_probe(
@@ -174,7 +279,7 @@ async def _identity_probe(
     model: ModelTarget,
     settings: ProbeSettings,
 ) -> ProbeResult:
-    started = utc_now()
+    started = local_now()
     family = infer_family(model.model, model.claimed_family)
     expected_keywords = developer_keywords(family)
     messages = [
@@ -237,7 +342,7 @@ async def _identity_probe(
 
 
 async def _acrostic_probe(client: OpenAICompatClient, model: ModelTarget, settings: ProbeSettings) -> ProbeResult:
-    started = utc_now()
+    started = local_now()
     messages = [{"role": "user", "content": "请写一首四行中文藏头诗，四行首字依次必须是“火眼验真”，每行恰好 7 个汉字，不要标点，不要解释。"}]
     try:
         response = await client.chat_completion(
@@ -297,7 +402,7 @@ def _normalize_consistency_text(text: str) -> str:
 
 
 async def _response_consistency_probe(client: OpenAICompatClient, model: ModelTarget, settings: ProbeSettings) -> ProbeResult:
-    started = utc_now()
+    started = local_now()
     prompt = (
         "请用中文三句话解释 TCP 三次握手为什么既能同步序列号，"
         "又能避免历史连接请求造成误连。不要标题，不要列表。"
@@ -353,22 +458,36 @@ async def _response_consistency_probe(client: OpenAICompatClient, model: ModelTa
     complete_responses = sum(1 for hit_count in per_response_anchor_hits if hit_count == len(anchor_groups))
     min_anchor_hits = min(per_response_anchor_hits) if per_response_anchor_hits else None
 
+    similarity_floor_pass = 0.65
+    similarity_floor_warn = 0.45
+    min_similarity_floor_pass = 0.55
+    min_similarity_floor_warn = 0.35
+
     if avg_similarity is None:
         status = ProbeStatus.ERROR
         score = 0.0
         summary = "Unable to compute response consistency similarity."
-    elif complete_responses == len(raw_responses):
+    elif (
+        complete_responses == len(raw_responses)
+        and avg_similarity >= similarity_floor_pass
+        and (min_similarity or 0.0) >= min_similarity_floor_pass
+    ):
         status = ProbeStatus.PASS
-        score = 1.0 if average_anchor_coverage is None else average_anchor_coverage
-        summary = "Repeated prompts preserved the expected semantic anchors across all sampled responses."
-    elif average_anchor_coverage is not None and average_anchor_coverage >= 0.75:
+        score = min(1.0, (average_anchor_coverage or 0.0) * 0.7 + avg_similarity * 0.3)
+        summary = "Repeated prompts preserved both the expected semantic anchors and a reasonable textual similarity floor."
+    elif (
+        average_anchor_coverage is not None
+        and average_anchor_coverage >= 0.75
+        and avg_similarity >= similarity_floor_warn
+        and (min_similarity or 0.0) >= min_similarity_floor_warn
+    ):
         status = ProbeStatus.WARN
-        score = average_anchor_coverage
-        summary = "Repeated prompts preserved most semantic anchors, but some sampled responses drifted."
+        score = min(1.0, (average_anchor_coverage * 0.7) + (avg_similarity * 0.3))
+        summary = "Repeated prompts preserved most semantic anchors, but wording or emphasis still drifted across samples."
     else:
         status = ProbeStatus.FAIL
-        score = average_anchor_coverage if average_anchor_coverage is not None else 0.0
-        summary = "Repeated prompts missed key semantic anchors, so the responses were not stable enough."
+        score = min(1.0, ((average_anchor_coverage or 0.0) * 0.7) + ((avg_similarity or 0.0) * 0.3))
+        summary = "Repeated prompts missed either the semantic-anchor floor or the textual-similarity floor, so the responses were not stable enough."
 
     return _result(
         probe="response_consistency",
@@ -385,6 +504,10 @@ async def _response_consistency_probe(client: OpenAICompatClient, model: ModelTa
             "complete_response_count": complete_responses,
             "average_anchor_coverage": round(average_anchor_coverage, 4) if average_anchor_coverage is not None else None,
             "min_anchor_hits_per_response": min_anchor_hits,
+            "similarity_floor_pass": similarity_floor_pass,
+            "similarity_floor_warn": similarity_floor_warn,
+            "min_similarity_floor_pass": min_similarity_floor_pass,
+            "min_similarity_floor_warn": min_similarity_floor_warn,
         },
         evidence={"responses": [compact_text(text, limit=500) for text in raw_responses]},
         started_at=started,
@@ -392,7 +515,7 @@ async def _response_consistency_probe(client: OpenAICompatClient, model: ModelTa
 
 
 async def _boundary_reasoning_probe(client: OpenAICompatClient, model: ModelTarget, settings: ProbeSettings) -> ProbeResult:
-    started = utc_now()
+    started = local_now()
     expected = ["[0]", "[0, 1]", "[10, 1]", "[0, 1, 2]"]
     messages = [
         {
@@ -432,7 +555,7 @@ async def _boundary_reasoning_probe(client: OpenAICompatClient, model: ModelTarg
 
 
 async def _linguistic_fingerprint_probe(client: OpenAICompatClient, model: ModelTarget, settings: ProbeSettings) -> ProbeResult:
-    started = utc_now()
+    started = local_now()
     messages = [
         {
             "role": "user",
@@ -476,16 +599,125 @@ async def _linguistic_fingerprint_probe(client: OpenAICompatClient, model: Model
     )
 
 
+def _verify_challenge(challenge: dict[str, Any], response_text: str) -> bool:
+    verify_type = challenge["verify"]
+    answer = challenge["answer"]
+    text = response_text.strip()
+    if verify_type == "keyword":
+        return str(answer) in text
+    if verify_type == "number":
+        numbers = re.findall(r"-?\d+\.?\d*", text)
+        return str(answer) in numbers
+    if verify_type == "approximate":
+        numbers = re.findall(r"-?\d+\.?\d*", text)
+        for num_str in numbers:
+            try:
+                if abs(float(num_str) - float(answer)) < 0.1:
+                    return True
+            except ValueError:
+                continue
+        return False
+    return False
+
+
+def _capability_threshold(family: str, total_challenges: int) -> int:
+    ratio = FAMILY_FINGERPRINT_RATIO.get(family, 0.6)
+    threshold = math.ceil(total_challenges * ratio)
+    return max(1, min(total_challenges, threshold))
+
+
+async def _capability_fingerprint_probe(
+    client: OpenAICompatClient,
+    provider: ProviderTarget,
+    model: ModelTarget,
+    settings: ProbeSettings,
+) -> ProbeResult:
+    started = local_now()
+    family = infer_family(model.model, model.claimed_family)
+    total_challenges = len(CAPABILITY_CHALLENGES)
+    minimum = _capability_threshold(family, total_challenges)
+
+    challenge_results: list[dict[str, Any]] = []
+    correct_count = 0
+    for challenge in CAPABILITY_CHALLENGES:
+        try:
+            response = await client.chat_completion(
+                model=model.model,
+                messages=[{"role": "user", "content": challenge["question"]}],
+                timeout_seconds=settings.request_timeout_seconds,
+                temperature=0,
+                max_tokens=min(settings.completion_max_tokens, 60),
+            )
+            passed = _verify_challenge(challenge, response.content)
+        except Exception:
+            passed = False
+            response = None
+        if passed:
+            correct_count += 1
+        challenge_results.append({
+            "id": challenge["id"],
+            "question": challenge["question"],
+            "expected_answer": str(challenge["answer"]),
+            "verify_type": challenge["verify"],
+            "passed": passed,
+            "response_excerpt": compact_text(response.content) if response else None,
+        })
+
+    if correct_count >= minimum:
+        status = ProbeStatus.PASS
+        score = correct_count / total_challenges
+        summary = f"Capability fingerprint passed: {correct_count}/{total_challenges} correct (threshold {minimum} for {family})."
+    elif correct_count >= minimum - 1:
+        status = ProbeStatus.WARN
+        score = correct_count / total_challenges
+        summary = f"Capability fingerprint borderline: {correct_count}/{total_challenges} correct (threshold {minimum} for {family})."
+    else:
+        status = ProbeStatus.FAIL
+        score = correct_count / total_challenges
+        summary = f"Capability fingerprint failed: {correct_count}/{total_challenges} correct (threshold {minimum} for {family})."
+
+    return _result(
+        probe="capability_fingerprint",
+        status=status,
+        summary=summary,
+        score=score,
+        metrics={
+            "correct_count": correct_count,
+            "total_challenges": total_challenges,
+            "family_threshold": minimum,
+            "family_threshold_ratio": ratio if (ratio := FAMILY_FINGERPRINT_RATIO.get(family, 0.6)) else None,
+            "claimed_family": family,
+        },
+        evidence={"challenge_results": challenge_results},
+        started_at=started,
+    )
+
+
 async def run_authenticity_suite(
     client: OpenAICompatClient,
     provider: ProviderTarget,
     model: ModelTarget,
     settings: ProbeSettings,
+    progress_callback: ProgressCallback | None = None,
 ) -> list[ProbeResult]:
-    return [
-        await _identity_probe(client, provider, model, settings),
-        await _acrostic_probe(client, model, settings),
-        await _boundary_reasoning_probe(client, model, settings),
-        await _linguistic_fingerprint_probe(client, model, settings),
-        await _response_consistency_probe(client, model, settings),
-    ]
+    return await run_probe_sequence(
+        suite="authenticity",
+        progress_callback=progress_callback,
+        steps=[
+            ("identity", lambda: _identity_probe(client, provider, model, settings)),
+            (
+                "capability_fingerprint",
+                lambda: _capability_fingerprint_probe(client, provider, model, settings),
+            ),
+            ("acrostic_constraints", lambda: _acrostic_probe(client, model, settings)),
+            ("boundary_reasoning", lambda: _boundary_reasoning_probe(client, model, settings)),
+            (
+                "linguistic_fingerprint",
+                lambda: _linguistic_fingerprint_probe(client, model, settings),
+            ),
+            (
+                "response_consistency",
+                lambda: _response_consistency_probe(client, model, settings),
+            ),
+        ],
+    )

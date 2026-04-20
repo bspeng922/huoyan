@@ -12,7 +12,15 @@ import httpx
 from huoyan.client import OpenAICompatClient
 from huoyan.config import ModelTarget, ProbeSettings, ProviderTarget
 from huoyan.models import ProbeResult, ProbeStatus
-from huoyan.utils import estimate_prompt_tokens, infer_family, usage_input_tokens, utc_now
+from huoyan.progress import ProgressCallback, run_probe_sequence
+from huoyan.utils import (
+    estimate_prompt_tokens,
+    estimate_text_tokens,
+    infer_family,
+    local_now,
+    usage_input_tokens,
+    usage_output_tokens,
+)
 
 
 def _result(
@@ -31,8 +39,8 @@ def _result(
         summary=summary,
         metrics=metrics or {},
         evidence=evidence or {},
-        started_at=started_at or utc_now(),
-        finished_at=utc_now(),
+        started_at=started_at or local_now(),
+        finished_at=local_now(),
     )
 
 
@@ -41,26 +49,28 @@ async def _token_alignment_probe(
     model: ModelTarget,
     settings: ProbeSettings,
 ) -> ProbeResult:
-    started = utc_now()
+    started = local_now()
+    expected_output = "HX_TOKEN_OUTPUT_BASELINE_20260416_ALPHA_BETA_31415926"
     messages = [
         {
             "role": "user",
             "content": (
-                "请阅读下面固定文本，然后只回答 OK：\n"
+                "请阅读下面固定文本，然后只原样输出指定字符串，不要解释，不要引号，不要代码块：\n"
                 "弱智吧问题、文言文、Rust 生命周期、SQL JSON Path、藏头诗与并发压测会混在一起，"
-                "目的是观测 token 统计是否与本地估算对齐。"
+                "目的是观测 token 统计是否与本地估算对齐。\n"
+                f"请只输出：{expected_output}"
             ),
         }
     ]
     family = infer_family(model.model, model.claimed_family)
-    local = estimate_prompt_tokens(messages, model.model, family)
+    local_prompt = estimate_prompt_tokens(messages, model.model, family)
     try:
         response = await client.chat_completion(
             model=model.model,
             messages=messages,
             timeout_seconds=settings.request_timeout_seconds,
             temperature=0,
-            max_tokens=8,
+            max_tokens=32,
         )
     except Exception as exc:
         return _result(
@@ -70,56 +80,99 @@ async def _token_alignment_probe(
             started_at=started,
         )
 
-    api_tokens = usage_input_tokens(response.usage)
-    if api_tokens is None:
+    api_prompt_tokens = usage_input_tokens(response.usage)
+    api_output_tokens = usage_output_tokens(response.usage)
+    if api_prompt_tokens is None:
         return _result(
             probe="token_alignment",
             status=ProbeStatus.WARN,
-            summary="API did not return input/prompt token usage.",
-            metrics={"local_estimate": local},
+            summary="API did not return input/prompt token usage, so usage-token alignment could not be checked on the prompt side.",
+            metrics={"local_prompt_estimate": local_prompt},
             started_at=started,
         )
-    if not local["supported"] or local["count"] is None:
+    if not local_prompt["supported"] or local_prompt["count"] is None:
         return _result(
             probe="token_alignment",
             status=ProbeStatus.SKIP,
-            summary="No reliable local tokenizer mapping is available for this model family.",
-            metrics={"api_prompt_tokens": api_tokens, "local_estimate": local},
+            summary="No reliable local tokenizer mapping is available for this model family, so usage-token alignment is recorded but not scored.",
+            metrics={"api_prompt_tokens": api_prompt_tokens, "local_prompt_estimate": local_prompt},
             started_at=started,
         )
 
-    delta = api_tokens - local["count"]
-    ratio = api_tokens / local["count"] if local["count"] else None
-    if local["approximate"]:
-        if ratio is not None and 0.5 <= ratio <= 1.5:
+    returned_output = response.content.strip()
+    output_exact_match = returned_output == expected_output
+    local_output = estimate_text_tokens(
+        expected_output if output_exact_match else returned_output,
+        model.model,
+        family,
+    )
+
+    prompt_delta = api_prompt_tokens - local_prompt["count"]
+    prompt_ratio = api_prompt_tokens / local_prompt["count"] if local_prompt["count"] else None
+    output_delta = None
+    output_ratio = None
+    if api_output_tokens is not None and local_output["count"]:
+        output_delta = api_output_tokens - local_output["count"]
+        output_ratio = api_output_tokens / local_output["count"]
+
+    approximate = bool(local_prompt["approximate"] or local_output["approximate"])
+    if approximate:
+        wide_band_ok = True
+        for ratio in [prompt_ratio, output_ratio]:
+            if ratio is not None and not (0.5 <= ratio <= 1.5):
+                wide_band_ok = False
+                break
+        if wide_band_ok:
             status = ProbeStatus.SKIP
-            summary = "Local tokenizer mapping for this model family is approximate only; recorded the ratio for reference but excluded it from scoring."
+            summary = "Local tokenizer mapping for this model family is approximate only; prompt/output usage-token ratios are recorded for reference and excluded from scoring."
         else:
             status = ProbeStatus.WARN
-            summary = "API token usage diverges strongly even under an approximate local tokenizer mapping."
+            summary = "API usage-token counts diverge strongly even under an approximate local tokenizer mapping."
     else:
-        if ratio is not None and 0.9 <= ratio <= 1.1:
-            status = ProbeStatus.PASS
-            summary = "API token usage aligns with the local tokenizer estimate."
-        elif ratio is not None and 0.75 <= ratio <= 1.25:
+        prompt_ok = prompt_ratio is not None and 0.9 <= prompt_ratio <= 1.1
+        prompt_warn = prompt_ratio is not None and 0.75 <= prompt_ratio <= 1.25
+        output_ok = output_ratio is not None and 0.9 <= output_ratio <= 1.1
+        output_warn = output_ratio is not None and 0.75 <= output_ratio <= 1.25
+
+        if api_output_tokens is None:
             status = ProbeStatus.WARN
-            summary = "API token usage is somewhat offset from the local tokenizer estimate."
+            summary = "API returned prompt token usage, but completion/output token usage was missing."
+        elif not output_exact_match:
+            status = ProbeStatus.WARN
+            summary = "Model did not echo the expected output exactly, so the output-side usage-token comparison is only partially reliable."
+        elif prompt_ok and output_ok:
+            status = ProbeStatus.PASS
+            summary = "Prompt and echoed-output usage-token counts align with the local tokenizer estimates."
+        elif prompt_warn and output_warn:
+            status = ProbeStatus.WARN
+            summary = "Prompt or echoed-output usage-token counts are somewhat offset from the local tokenizer estimates."
         else:
             status = ProbeStatus.FAIL
-            summary = "API token usage is materially offset from the local tokenizer estimate."
+            summary = "Prompt or echoed-output usage-token counts are materially offset from the local tokenizer estimates."
 
     return _result(
         probe="token_alignment",
         status=status,
         summary=summary,
         metrics={
-            "api_prompt_tokens": api_tokens,
-            "local_prompt_tokens": local["count"],
-            "delta_tokens": delta,
-            "ratio": round(ratio, 4) if ratio is not None else None,
-            "tokenizer": local["tokenizer"],
-            "approximate": local["approximate"],
+            "api_prompt_tokens": api_prompt_tokens,
+            "local_prompt_tokens": local_prompt["count"],
+            "prompt_delta_tokens": prompt_delta,
+            "prompt_ratio": round(prompt_ratio, 4) if prompt_ratio is not None else None,
+            "api_output_tokens": api_output_tokens,
+            "local_output_tokens": local_output["count"],
+            "output_delta_tokens": output_delta,
+            "output_ratio": round(output_ratio, 4) if output_ratio is not None else None,
+            "output_exact_match": output_exact_match,
+            "delta_tokens": prompt_delta,
+            "ratio": round(prompt_ratio, 4) if prompt_ratio is not None else None,
+            "tokenizer": local_prompt["tokenizer"],
+            "approximate": approximate,
+            "alignment_scope": "api_usage_vs_local_estimate",
+            "billing_audit": False,
+            "billing_caveat": "This probe compares API usage-token counts with local estimates. It is not a billing multiplier audit.",
         },
+        evidence={"expected_output": expected_output, "actual_output": returned_output},
         started_at=started,
     )
 
@@ -158,7 +211,7 @@ def _tls_inspect(base_url: str) -> dict[str, Any]:
 
 
 async def _tls_probe(provider: ProviderTarget) -> ProbeResult:
-    started = utc_now()
+    started = local_now()
     try:
         inspection = await asyncio.to_thread(_tls_inspect, provider.base_url)
     except Exception as exc:
@@ -209,7 +262,7 @@ async def _tls_probe(provider: ProviderTarget) -> ProbeResult:
 
 
 async def _privacy_policy_probe(provider: ProviderTarget) -> ProbeResult:
-    started = utc_now()
+    started = local_now()
     if provider.privacy_policy_url:
         return _result(
             probe="privacy_policy",
@@ -265,71 +318,119 @@ def _extract_rate_limit_headers(headers: dict[str, Any]) -> dict[str, str]:
     return {key: normalized[key] for key in interesting if key in normalized}
 
 
+async def _rate_limit_observation(
+    client: OpenAICompatClient,
+    provider: ProviderTarget,
+    model_name: str,
+    timeout_seconds: float,
+    *,
+    phase: str,
+    attempt: int,
+) -> dict[str, Any]:
+    payload = _build_valid_minimal_payload(provider, model_name)
+    raw = await client.raw_json_request(payload=payload, timeout_seconds=timeout_seconds)
+    return {
+        "phase": phase,
+        "attempt": attempt,
+        "status_code": raw.status_code,
+        "rate_limit_headers": _extract_rate_limit_headers(raw.headers),
+        "response_excerpt": raw.text[:240],
+    }
+
+
 async def _rate_limit_transparency_probe(
     client: OpenAICompatClient,
     provider: ProviderTarget,
     model: ModelTarget,
     settings: ProbeSettings,
 ) -> ProbeResult:
-    started = utc_now()
-    observations: list[dict[str, Any]] = []
+    started = local_now()
+    passive_observations: list[dict[str, Any]] = []
+    active_observations: list[dict[str, Any]] = []
     saw_429 = False
     saw_headers = False
     saw_headers_on_429 = False
     saw_retry_after_on_429 = False
-    for attempt in range(3):
-        payload = _build_valid_minimal_payload(provider, model.model)
-        raw = await client.raw_json_request(payload=payload, timeout_seconds=settings.request_timeout_seconds)
-        rate_headers = _extract_rate_limit_headers(raw.headers)
+    for attempt in range(2):
+        observation = await _rate_limit_observation(
+            client,
+            provider,
+            model.model,
+            settings.request_timeout_seconds,
+            phase="passive",
+            attempt=attempt + 1,
+        )
+        rate_headers = observation["rate_limit_headers"]
         if rate_headers:
             saw_headers = True
-        if raw.status_code == 429:
+        if observation["status_code"] == 429:
             saw_429 = True
             if rate_headers:
                 saw_headers_on_429 = True
             if "retry-after" in rate_headers:
                 saw_retry_after_on_429 = True
-        observations.append(
-            {
-                "attempt": attempt + 1,
-                "status_code": raw.status_code,
-                "rate_limit_headers": rate_headers,
-                "response_excerpt": raw.text[:240],
-            }
-        )
+        passive_observations.append(observation)
         await asyncio.sleep(0.2)
+
+    burst_size = max(6, max(settings.concurrency_levels or [6]))
+    burst_tasks = [
+        asyncio.create_task(
+            _rate_limit_observation(
+                client,
+                provider,
+                model.model,
+                settings.request_timeout_seconds,
+                phase="active_burst",
+                attempt=index + 1,
+            )
+        )
+        for index in range(burst_size)
+    ]
+    for observation in await asyncio.gather(*burst_tasks):
+        rate_headers = observation["rate_limit_headers"]
+        if rate_headers:
+            saw_headers = True
+        if observation["status_code"] == 429:
+            saw_429 = True
+            if rate_headers:
+                saw_headers_on_429 = True
+            if "retry-after" in rate_headers:
+                saw_retry_after_on_429 = True
+        active_observations.append(observation)
 
     if saw_429 and not saw_headers_on_429:
         status = ProbeStatus.FAIL
-        summary = "Rate limiting occurred but the 429 responses did not expose Retry-After or x-ratelimit-* metadata."
+        summary = "Active or passive sampling hit rate limiting, but the 429 responses did not expose Retry-After or x-ratelimit-* metadata."
     elif saw_429 and saw_headers_on_429:
         status = ProbeStatus.PASS
-        summary = "Rate limiting was triggered and the 429 responses exposed rate-limit metadata."
+        summary = "Passive or active sampling triggered rate limiting, and the 429 responses exposed rate-limit metadata."
     elif saw_headers:
         status = ProbeStatus.PASS
-        summary = "Observed proactive rate-limit metadata in non-429 responses."
+        summary = "Observed proactive rate-limit metadata during passive or active sampling."
     else:
         status = ProbeStatus.SKIP
-        summary = "Rate limiting was not triggered and no proactive metadata was observed, so transparency could not be evaluated."
+        summary = "Neither passive sampling nor the active burst exposed rate-limit metadata, so transparency could not be evaluated."
 
     return _result(
         probe="rate_limit_transparency",
         status=status,
         summary=summary,
         metrics={
-            "sampled_requests": len(observations),
+            "sampled_requests": len(passive_observations) + len(active_observations),
+            "passive_sample_count": len(passive_observations),
+            "active_burst_size": burst_size,
             "saw_429": saw_429,
             "saw_rate_limit_headers": saw_headers,
             "saw_rate_limit_headers_on_429": saw_headers_on_429,
             "saw_retry_after_on_429": saw_retry_after_on_429,
         },
-        evidence={"observations": observations},
+        evidence={"passive_observations": passive_observations, "active_observations": active_observations},
         started_at=started,
     )
 
 
 async def _security_headers_probe(provider: ProviderTarget) -> ProbeResult:
-    started = utc_now()
+    started = local_now()
     parsed = urlparse(provider.base_url)
     if parsed.scheme.lower() != "https":
         return _result(
@@ -385,11 +486,19 @@ async def run_cost_security_suite(
     provider: ProviderTarget,
     model: ModelTarget,
     settings: ProbeSettings,
+    progress_callback: ProgressCallback | None = None,
 ) -> list[ProbeResult]:
-    return [
-        await _token_alignment_probe(client, model, settings),
-        await _tls_probe(provider),
-        await _security_headers_probe(provider),
-        await _rate_limit_transparency_probe(client, provider, model, settings),
-        await _privacy_policy_probe(provider),
-    ]
+    return await run_probe_sequence(
+        suite="cost_security",
+        progress_callback=progress_callback,
+        steps=[
+            ("token_alignment", lambda: _token_alignment_probe(client, model, settings)),
+            ("tls_baseline", lambda: _tls_probe(provider)),
+            ("security_headers", lambda: _security_headers_probe(provider)),
+            (
+                "rate_limit_transparency",
+                lambda: _rate_limit_transparency_probe(client, provider, model, settings),
+            ),
+            ("privacy_policy", lambda: _privacy_policy_probe(provider)),
+        ],
+    )

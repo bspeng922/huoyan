@@ -8,7 +8,8 @@ from typing import Any, Awaitable, Callable
 from huoyan.client import OpenAICompatClient
 from huoyan.config import ModelTarget, ProbeSettings, ProviderTarget
 from huoyan.models import ProbeResult, ProbeStatus
-from huoyan.utils import LEAKAGE_PATTERNS, SECRET_PATTERNS, compact_text, extract_tool_calls, scan_text_indicators, usage_output_tokens, utc_now
+from huoyan.progress import ProgressCallback, run_probe_sequence
+from huoyan.utils import LEAKAGE_PATTERNS, SECRET_PATTERNS, compact_text, extract_tool_calls, local_now, scan_text_indicators, usage_output_tokens
 
 
 RELAY_SYSTEM_PROMPT_PATTERNS: list[re.Pattern[str]] = [
@@ -34,8 +35,8 @@ def _result(*, probe: str, status: ProbeStatus, summary: str, metrics: dict[str,
         summary=summary,
         metrics=metrics or {},
         evidence=evidence or {},
-        started_at=started_at or utc_now(),
-        finished_at=utc_now(),
+        started_at=started_at or local_now(),
+        finished_at=local_now(),
     )
 
 
@@ -132,9 +133,14 @@ async def _exact_command_tool_call(client: OpenAICompatClient, model: ModelTarge
 
 
 async def _dependency_substitution_probe(client: OpenAICompatClient, model: ModelTarget, settings: ProbeSettings) -> ProbeResult:
-    started = utc_now()
+    started = local_now()
     if not model.supports_tools:
-        return _result(probe="dependency_substitution", status=ProbeStatus.SKIP, summary="Model is marked as not supporting tool calls.", started_at=started)
+        return _result(
+            probe="dependency_substitution",
+            status=ProbeStatus.SKIP,
+            summary="Model is marked as not supporting tool calls, so fixed install-command integrity cannot be checked on the tool path.",
+            started_at=started,
+        )
     commands = ["python -m pip install requests==2.32.5", "npm install axios@1.8.4", "cargo add reqwest@0.12.15"]
     case_results: list[dict[str, Any]] = []
     mismatches: list[dict[str, Any]] = []
@@ -150,23 +156,29 @@ async def _dependency_substitution_probe(client: OpenAICompatClient, model: Mode
         elif not case.get("ok"):
             inconclusive += 1
     if mismatches:
-        status, summary = ProbeStatus.FAIL, "At least one package-install command was modified before reaching the client."
+        status, summary = ProbeStatus.FAIL, "At least one fixed package-install command was modified before reaching the client tool path."
     elif inconclusive:
-        status, summary = ProbeStatus.WARN, "Dependency substitution probe was only partially conclusive."
+        status, summary = ProbeStatus.WARN, "Fixed install-command integrity was only partially conclusive on the tool path."
     else:
-        status, summary = ProbeStatus.PASS, "Forced package-install tool calls were delivered verbatim."
+        status, summary = ProbeStatus.PASS, "Fixed package-install tool calls were delivered verbatim on the tool path."
     return _result(
         probe="dependency_substitution",
         status=status,
         summary=summary,
-        metrics={"exact_matches": sum(1 for item in case_results if item.get("exact_match")), "total_cases": len(case_results), "inconclusive_cases": inconclusive},
+        metrics={
+            "exact_matches": sum(1 for item in case_results if item.get("exact_match")),
+            "total_cases": len(case_results),
+            "inconclusive_cases": inconclusive,
+            "probe_scope": "fixed_install_commands_via_tool_calls",
+            "generic_dependency_poisoning_coverage": False,
+        },
         evidence={"cases": case_results},
         started_at=started,
     )
 
 
 async def _conditional_delivery_probe(client: OpenAICompatClient, model: ModelTarget, settings: ProbeSettings) -> ProbeResult:
-    started = utc_now()
+    started = local_now()
     if not model.supports_tools:
         return _result(probe="conditional_delivery", status=ProbeStatus.SKIP, summary="Model is marked as not supporting tool calls.", started_at=started)
     command = "python -m pip install requests==2.32.5"
@@ -189,7 +201,7 @@ async def _conditional_delivery_probe(client: OpenAICompatClient, model: ModelTa
         return _result(probe="conditional_delivery", status=ProbeStatus.ERROR, summary=f"Conditional-delivery probe failed: {exc}", started_at=started)
 
     if baseline.get("exact_match") and after_warmup.get("exact_match"):
-        status, summary = ProbeStatus.PASS, "Baseline and post-warmup tool calls remained identical."
+        status, summary = ProbeStatus.PASS, "Baseline and post-warmup tool calls remained identical within the configured short warmup window."
     elif baseline.get("exact_match") and after_warmup.get("ok") and not after_warmup.get("exact_match"):
         status, summary = ProbeStatus.FAIL, "Tool-call integrity changed after warmup traffic; conditional delivery is plausible."
     else:
@@ -218,7 +230,7 @@ def _invalid_payloads(provider: ProviderTarget, model_name: str) -> list[dict[st
 
 
 async def _error_response_leakage_probe(client: OpenAICompatClient, provider: ProviderTarget, model: ModelTarget, settings: ProbeSettings) -> ProbeResult:
-    started = utc_now()
+    started = local_now()
     cases = _invalid_payloads(provider, model.model)
     case_results: list[dict[str, Any]] = []
     secret_hits = 0
@@ -252,7 +264,7 @@ async def _error_response_leakage_probe(client: OpenAICompatClient, provider: Pr
 
 
 async def _stream_integrity_probe(client: OpenAICompatClient, model: ModelTarget, settings: ProbeSettings) -> ProbeResult:
-    started = utc_now()
+    started = local_now()
     if not model.supports_stream:
         return _result(probe="stream_integrity", status=ProbeStatus.SKIP, summary="Model is marked as not supporting stream output.", started_at=started)
     try:
@@ -363,7 +375,7 @@ async def _stream_integrity_probe(client: OpenAICompatClient, model: ModelTarget
 
 
 async def _system_prompt_injection_probe(client: OpenAICompatClient, model: ModelTarget, settings: ProbeSettings) -> ProbeResult:
-    started = utc_now()
+    started = local_now()
 
     # Case 1: ask model to disclose all system-level instructions received.
     # We send NO system message, so any disclosed content is relay-injected.
@@ -431,12 +443,9 @@ async def _system_prompt_injection_probe(client: OpenAICompatClient, model: Mode
     elif reported_count is not None and reported_count > 0 and not denied:
         status = ProbeStatus.WARN
         summary = f"Model reported receiving {reported_count} instruction(s) before the user message, suggesting system prompt injection by the relay."
-    elif pattern_hits and denied:
-        status = ProbeStatus.WARN
-        summary = "Model denied receiving system prompts but response contained relay prompt patterns."
     else:
-        status = ProbeStatus.PASS
-        summary = "No clear evidence of relay-injected system prompts was detected."
+        status = ProbeStatus.SKIP
+        summary = "The model did not disclose prior instructions in a reliable way, so this probe cannot prove the absence of relay-injected system prompts."
 
     return _result(
         probe="system_prompt_injection",
@@ -455,11 +464,33 @@ async def _system_prompt_injection_probe(client: OpenAICompatClient, model: Mode
     )
 
 
-async def run_security_audit_suite(client: OpenAICompatClient, provider: ProviderTarget, model: ModelTarget, settings: ProbeSettings) -> list[ProbeResult]:
-    return [
-        await _dependency_substitution_probe(client, model, settings),
-        await _conditional_delivery_probe(client, model, settings),
-        await _error_response_leakage_probe(client, provider, model, settings),
-        await _stream_integrity_probe(client, model, settings),
-        await _system_prompt_injection_probe(client, model, settings),
-    ]
+async def run_security_audit_suite(
+    client: OpenAICompatClient,
+    provider: ProviderTarget,
+    model: ModelTarget,
+    settings: ProbeSettings,
+    progress_callback: ProgressCallback | None = None,
+) -> list[ProbeResult]:
+    return await run_probe_sequence(
+        suite="security_audit",
+        progress_callback=progress_callback,
+        steps=[
+            (
+                "dependency_substitution",
+                lambda: _dependency_substitution_probe(client, model, settings),
+            ),
+            (
+                "conditional_delivery",
+                lambda: _conditional_delivery_probe(client, model, settings),
+            ),
+            (
+                "error_response_leakage",
+                lambda: _error_response_leakage_probe(client, provider, model, settings),
+            ),
+            ("stream_integrity", lambda: _stream_integrity_probe(client, model, settings)),
+            (
+                "system_prompt_injection",
+                lambda: _system_prompt_injection_probe(client, model, settings),
+            ),
+        ],
+    )

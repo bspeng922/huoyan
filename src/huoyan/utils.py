@@ -67,6 +67,10 @@ LEAKAGE_PATTERNS: dict[str, re.Pattern[str]] = {
 }
 
 
+def local_now() -> datetime:
+    return datetime.now().astimezone()
+
+
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
