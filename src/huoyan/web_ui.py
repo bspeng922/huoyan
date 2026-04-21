@@ -18,8 +18,9 @@ def _strip_home_explainer(body: str) -> str:
         <div\ class="panel-head">\s*
         <h2>.*?</h2>\s*
         </div>\s*
-        <div\ class="note-body">.*?<strong>Compare</strong>.*?</div>\s*
-        </div>
+        <div\ class="note-body">.*?</div>\s*
+        </div>\s*
+        (?=\n\s*</section>)
         """,
         re.DOTALL | re.VERBOSE,
     )
@@ -274,7 +275,13 @@ PAGE_TEMPLATE = """<!doctype html>
     .workspace {
       margin-top: 18px;
       display: grid;
+      grid-template-columns: minmax(0, 1fr);
       gap: 18px;
+    }
+
+    #homePage .home-panel {
+      width: 100%;
+      margin-inline: auto;
     }
 
     .surface {
@@ -1241,7 +1248,7 @@ INDEX_BODY = """
     </section>
 
     <main class="workspace">
-      <section class="surface">
+      <section class="surface home-panel">
           <div class="panel-head">
             <h2>运行设置</h2>
             <span id="runStatus" class="status-dot">待命</span>
@@ -1333,7 +1340,7 @@ INDEX_BODY = """
         </div>
       </section>
 
-      <section class="surface">
+      <section class="surface home-panel">
         <div class="panel-head">
           <h2>当前结果</h2>
         </div>
@@ -1361,6 +1368,11 @@ const progressValue = document.getElementById('progressValue');
 const progressFill = document.getElementById('progressFill');
 
 let activePollTimer = null;
+
+function setRunButtonVisibility(visible) {
+  runButton.hidden = !visible;
+  runButton.disabled = !visible;
+}
 
 function setRunState(mode, text) {
   runStatus.className = 'status-dot';
@@ -1426,7 +1438,7 @@ async function pollJob(jobId) {
       setRunState('done', '测试完成');
       resultMount.scrollIntoView({ behavior: 'smooth', block: 'start' });
       showToast('测试已完成，历史记录页可查看记录与对比。');
-      runButton.disabled = false;
+      setRunButtonVisibility(true);
       return;
     }
 
@@ -1435,19 +1447,20 @@ async function pollJob(jobId) {
       setRunState('error', '运行失败');
       resultMount.innerHTML = `<div class="empty-state reveal">运行失败：${escapeHtml(job.error || '未知错误')}</div>`;
       showToast(job.error || '运行失败', 'error');
-      runButton.disabled = false;
+      setRunButtonVisibility(true);
       return;
     }
 
-    activePollTimer = window.setTimeout(() => {
-      pollJob(jobId);
-    }, 800);
+    await new Promise((resolve) => {
+      activePollTimer = window.setTimeout(resolve, 800);
+    });
+    return pollJob(jobId);
   } catch (error) {
     stopPolling();
     setRunState('error', '运行失败');
     resultMount.innerHTML = `<div class="empty-state reveal">运行失败：${escapeHtml(error.message)}</div>`;
     showToast(error.message, 'error');
-    runButton.disabled = false;
+    setRunButtonVisibility(true);
   }
 }
 
@@ -1467,7 +1480,7 @@ runForm.addEventListener('submit', async (event) => {
   };
 
   stopPolling();
-  runButton.disabled = true;
+  setRunButtonVisibility(false);
   setRunState('running', '测试进行中');
   setProgress({
     status: 'running',
@@ -1475,8 +1488,6 @@ runForm.addEventListener('submit', async (event) => {
     progress_total: 0,
     progress_percent: 0,
   });
-  resultMount.innerHTML = '<div class="empty-state reveal">正在运行测试，进度会在上方实时更新。结果会在当前区域自动刷新。</div>';
-  setRunState('running', '测试进行中');
   resultMount.innerHTML = '<div class="empty-state reveal">正在运行测试，请保持页面开启。结果会在当前区域自动刷新。</div>';
 
   try {
@@ -1486,18 +1497,12 @@ runForm.addEventListener('submit', async (event) => {
     });
     setProgress(response.job);
     await pollJob(response.job.job_id);
-    return;
-    renderResult(response.report, response.record);
-    historyLink.href = `/history?selected=${encodeURIComponent(response.record.run_id)}`;
-    setRunState('done', '测试完成');
-    resultMount.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    showToast('测试已完成，历史记录页可查看记录与对比。');
   } catch (error) {
     setRunState('error', '运行失败');
     resultMount.innerHTML = `<div class="empty-state reveal">运行失败：${escapeHtml(error.message)}</div>`;
     showToast(error.message, 'error');
   } finally {
-    runButton.disabled = false;
+    setRunButtonVisibility(true);
   }
 });
 """

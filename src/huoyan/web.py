@@ -392,7 +392,7 @@ async def _run_web_job(
         job_store.fail(job_id=job.job_id, error=str(exc))
 
 
-def run_server(host: str = "127.0.0.1", port: int = 8000, output_dir: str | Path = "reports") -> None:
+def run_server(host: str = "127.0.0.1", port: int = 8001, output_dir: str | Path = "reports") -> None:
     configure_logging()
     logger.info(
         "Launching uvicorn host=%s port=%s output_dir=%s",
@@ -2100,6 +2100,7 @@ INDEX_HTML = """<!doctype html>
       };
 
       runButton.disabled = true;
+      runButton.style.display = 'none';
       setRunState('running', '测试进行中');
       resultMount.innerHTML = '<div class="empty-state reveal">正在运行测试，请保持页面开启。结果会在当前区域自动刷新。</div>';
 
@@ -2119,6 +2120,7 @@ INDEX_HTML = """<!doctype html>
         showToast(error.message, 'error');
       } finally {
         runButton.disabled = false;
+        runButton.style.display = '';
       }
     });
 

@@ -66,7 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     web_parser = subparsers.add_parser("web", help="Start the Huoyan web console")
     web_parser.add_argument("--host", default="127.0.0.1", help="Bind host for the web server")
-    web_parser.add_argument("--port", type=int, default=8000, help="Bind port for the web server")
+    web_parser.add_argument("--port", type=int, default=8001, help="Bind port for the web server")
     web_parser.add_argument(
         "--output",
         default="reports",

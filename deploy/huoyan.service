@@ -1,0 +1,29 @@
+[Unit]
+Description=Huoyan Web Console - LLM relay benchmark toolkit
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=huoyan
+Group=huoyan
+WorkingDirectory=/opt/huoyan
+Environment=PATH=/opt/huoyan/venv/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/opt/huoyan/venv/bin/huoyan web --host 0.0.0.0 --port 8001 --output /opt/huoyan/reports
+Restart=on-failure
+RestartSec=5
+
+# 安全加固
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/huoyan/reports
+PrivateTmp=true
+
+# 日志
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=huoyan
+
+[Install]
+WantedBy=multi-user.target

@@ -73,10 +73,10 @@ python -m huoyan run your-config.yaml --suite authenticity --suite performance
 启动 Web 控制台：
 
 ```bash
-python -m huoyan web --host 127.0.0.1 --port 8000
+python -m huoyan web --host 127.0.0.1 --port 8001
 ```
 
-然后在浏览器打开 `http://127.0.0.1:8000`。
+然后在浏览器打开 `http://127.0.0.1:8001`。
 
 Web 控制台当前面向「单个中转 / 单个模型」的快速验证，提供以下能力：
 
